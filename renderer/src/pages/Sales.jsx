@@ -179,7 +179,7 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
 
     // Ref number generation — assigned after grouping, so one bill = one Ref
     const counters  = {}
-    const prefixMap = { payment: "PAYM", feed: "FEED", sale: "EGG", egg_sale: "EGG", medication: "MED", vaccine: "MED", manure: "MNR", bird_sale: "BIRD", mortality: "MORT" }
+    const prefixMap = { payment: "PAYM", feed: "FEED", sale: "EGG", egg_sale: "EGG", medication: "MED", vaccine: "MED", manure: "MNR", bird_sale: "BIRD", mortality: "MORT", adjustment: "ADJ" }
     const taggedFinalRows = finalRows.map(r => {
       const prefix = (r.source === "payment" && r.direction === "from_trader") ? "RCPT" : (prefixMap[r.source] || "REF")
       counters[prefix] = (counters[prefix] || 0) + 1
@@ -871,6 +871,10 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
                         <button onClick={() => editPayment(p)} style={{ ...btn("#eef2ff", "#1d4ed8"), padding: "3px 10px", fontSize: 11 }}>Edit</button>
                         <button onClick={() => deletePayment(p.id)} style={{ ...btn("#FCEBEB", "#A32D2D"), padding: "3px 10px", fontSize: 11 }}>Delete</button>
                       </div>
+                    ) : p.source === "adjustment" ? (
+                      <span style={{ fontSize: 11, color: "#475569", fontWeight: 500 }}>
+                        Adjustment
+                      </span>
                     ) : (
                       <span style={{ fontSize: 10, color: "#aaa" }} title="Edit this from the batch's own tab">
                         Edit in batch {p.batch_id}

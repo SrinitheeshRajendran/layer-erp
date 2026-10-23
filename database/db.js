@@ -664,6 +664,13 @@ function getTraderClosingBalance(prevDb, traderId, openingBalance) {
   const paidToTrader   = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction != 'from_trader'`).get(traderId)?.v || 0
   const receivedFromTrader = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction = 'from_trader'`).get(traderId)?.v || 0
 
+  let adjustments = 0
+  try {
+    adjustments = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_adjustments WHERE trader_id=? AND (voided IS NULL OR voided=0)`).get(traderId)?.v || 0
+  } catch (e) {
+    // If trader_adjustments not available on older DB
+  }
+
   // Medication debits for trader with pro-rata tax_pct matching getCrossBatchTraderLedger bill grouping
   let medDebits = 0
   try {
@@ -684,8 +691,8 @@ function getTraderClosingBalance(prevDb, traderId, openingBalance) {
     // If medication_log or tax_pct not available on older DB
   }
 
-  // credit (sales + payments to trader) - debit (feed + medication + payments from trader)
-  return Number(openingBalance) + Number(sales) - Number(feed) - Number(medDebits) + Number(paidToTrader) - Number(receivedFromTrader)
+  // credit (sales + payments to trader) - debit (feed + medication + payments from trader) + adjustments
+  return Number(openingBalance) + Number(sales) - Number(feed) - Number(medDebits) + Number(paidToTrader) - Number(receivedFromTrader) + Number(adjustments)
 }
 
 // Calculate net effect of a trader's rows copied into new year for active batches actually moving
@@ -1744,7 +1751,21 @@ module.exports = {
              (CASE WHEN COALESCE(direction,'to_trader') = 'from_trader' THEN amount ELSE 0 END) AS debit,
              'payment' AS source, mode, notes, COALESCE(direction,'to_trader') AS direction
       FROM trader_payments WHERE trader_id=?`).all(traderId)
-    return [...sales, ...feed, ...medication, ...payments].sort((a, b) => b.date.localeCompare(a.date))
+    let adjustments = []
+    try {
+      adjustments = d.prepare(`
+        SELECT id, date, '-' AS batch_id,
+               ('Adjustment' || COALESCE(' — ' || NULLIF(note,''), '')) AS particulars,
+               (CASE WHEN amount > 0 THEN amount ELSE 0 END) AS credit,
+               (CASE WHEN amount < 0 THEN -amount ELSE 0 END) AS debit,
+               'adjustment' AS source, note, amount
+        FROM trader_adjustments
+        WHERE trader_id=? AND (voided IS NULL OR voided=0)
+      `).all(traderId)
+    } catch (e) {
+      // If trader_adjustments not available on older DB
+    }
+    return [...sales, ...feed, ...medication, ...payments, ...adjustments].sort((a, b) => b.date.localeCompare(a.date))
   },
 
   // ───────────────────────────────────────────────
