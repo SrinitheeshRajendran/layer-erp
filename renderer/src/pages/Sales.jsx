@@ -56,10 +56,18 @@ const TRADER_PROFILES = [
   "Medicine Supplier",
   "Egg Buyer",
   "Old Birds Buyer",
-  "Manure Buyer"
-]
+  "Manure Buyer",
+];
 
-export default function Sales({ isReadOnly = false }) {
+function getPeriodOpeningBalance(storedOpening, allRows, periodStartDate) {
+  if (!periodStartDate) return Number(storedOpening || 0);
+  const beforeRows = groupBillRows(allRows.filter(r => r.date && r.date < periodStartDate));
+  const priorCredit = beforeRows.reduce((s, r) => s + Number(r.credit || 0), 0);
+  const priorDebit  = beforeRows.reduce((s, r) => s + Number(r.debit || 0), 0);
+  return Number(storedOpening || 0) + (priorCredit - priorDebit);
+}
+
+export default function Sales({ isReadOnly = false, activeYear = null }) {
   const [traders, setTraders] = useState([])
   const [selectedTrader, setSelectedTrader] = useState("")
   const [crossLedger, setCrossLedger] = useState([])
@@ -147,31 +155,20 @@ export default function Sales({ isReadOnly = false }) {
     const farmAddress = localStorage.getItem("farm_address") || "REDDIPUDUR, NAMAKKAL"
     const farmPhone   = localStorage.getItem("farm_phone")   || "8870044489"
 
-    // Date range — blank From/To means "include full history" on that side
-    const fromDate = printFrom ? new Date(printFrom) : null
-    const toDate   = printTo   ? new Date(printTo)   : null
+    const currentActiveYear = activeYear || new Date().getFullYear()
+    const periodStartDate = printFrom || `${currentActiveYear}-01-01`
+    const toDate   = printTo ? new Date(printTo) : null
 
     const inRange = r => {
-      const d = new Date(r.date)
-      if (fromDate && d < fromDate) return false
-      if (toDate   && d > toDate)   return false
+      if (!r.date) return false
+      if (r.date < periodStartDate) return false
+      if (toDate && new Date(r.date) > toDate) return false
       return true
     }
-    const before = r => fromDate ? new Date(r.date) < fromDate : false
 
-    // Opening balance = net of all transactions BEFORE the From date (none if From is blank)
-    // Grouped the same way as the printed rows below, so tax-inclusive medication
-    // totals are counted consistently on both sides of the opening balance.
-    const prevRows       = groupBillRows(crossLedger.filter(before))
-    const prevDebitSum   = prevRows.reduce((s, r) => s + Number(r.debit  || 0), 0)
-    const prevCreditSum  = prevRows.reduce((s, r) => s + Number(r.credit || 0), 0)
-    const traderOpening = Number(trader?.opening_balance || 0)
-
-    // Raw carried-forward diff
-    const carriedDiff = prevDebitSum - prevCreditSum  // positive = debit heavy = we owe them or they owe us
-    // Opening balance value
-    const openingAmt  = prevRows.length === 0 ? Math.abs(traderOpening) : Math.abs(carriedDiff)
-    const openingInDebit = prevRows.length === 0 ? traderOpening < 0 : carriedDiff > 0   // debit side of opening balance row
+    const displayedOpening = getPeriodOpeningBalance(trader?.opening_balance, crossLedger, periodStartDate)
+    const openingAmt = Math.abs(displayedOpening)
+    const openingInDebit = displayedOpening < 0
 
     // Rows within the selected range, ordered oldest → newest for printing
     const monthRowsRaw = crossLedger.filter(inRange).sort((a, b) => new Date(a.date) - new Date(b.date))
@@ -189,7 +186,7 @@ export default function Sales({ isReadOnly = false }) {
       return { ...r, ref: `${prefix}-${counters[prefix]}` }
     })
 
-    // Sub totals for this month only
+    // Sub totals for this period only
     const monDebit  = taggedFinalRows.reduce((s, r) => s + Number(r.debit  || 0), 0)
     const monCredit = taggedFinalRows.reduce((s, r) => s + Number(r.credit || 0), 0)
     const totalDebitSide  = monDebit  + (openingInDebit  ? openingAmt : 0)
@@ -203,17 +200,20 @@ export default function Sales({ isReadOnly = false }) {
     const fmtAmt = n => `₹${Number(n).toLocaleString("en-IN")}`
 
     const monthLabel = (!printFrom && !printTo)
-      ? "Full History"
-      : `${printFrom ? fmtDate(printFrom) : "Beginning"} to ${printTo ? fmtDate(printTo) : "Today"}`
+      ? `${currentActiveYear} Statement`
+      : `${printFrom ? fmtDate(printFrom) : `${currentActiveYear}-01-01`} to ${printTo ? fmtDate(printTo) : "Today"}`
 
-    const fromLabel = printFrom ? fmtDate(printFrom) : "Beginning"
+    const fromLabel = printFrom ? fmtDate(printFrom) : `${currentActiveYear}-01-01`
     const toLabel   = printTo   ? fmtDate(printTo)   : "Today"
 
     // Opening balance row HTML
     const openingRow = openingAmt > 0 ? `
       <tr class="opening">
         <td></td>
-        <td><strong>Opening Balance</strong></td>
+        <td>
+          <strong>Opening Balance</strong>
+          ${trader?.carried_from_year ? `<div style="font-size:10px;color:#64748b;font-style:italic;font-weight:normal;">Opening balance carried forward from ${trader.carried_from_year}</div>` : ''}
+        </td>
         <td></td>
         <td class="num">${openingInDebit  ? `<strong>${fmtAmt(openingAmt)}</strong>` : "—"}</td>
         <td class="num">${!openingInDebit ? `<strong>${fmtAmt(openingAmt)}</strong>` : "—"}</td>
@@ -445,6 +445,9 @@ export default function Sales({ isReadOnly = false }) {
     }
 
     if (editingTraderId) {
+      if (traderForm.carried_from_year) {
+        payload.carried_from_year = traderForm.carried_from_year
+      }
       if (window.api.updateTrader) {
         await window.api.updateTrader(editingTraderId, payload)
         notify("Trader profile updated successfully!")
@@ -456,7 +459,7 @@ export default function Sales({ isReadOnly = false }) {
 
     setShowAddTraderModal(false)
     setEditingTraderId(null)
-    setTraderForm({ name: "", phone: "", address: "", opening_balance: "0", types: [] })
+    setTraderForm({ name: "", phone: "", address: "", opening_balance: "0", types: [], carried_from_year: null })
     loadData()
   }
 
@@ -467,7 +470,8 @@ export default function Sales({ isReadOnly = false }) {
       phone: trader.phone || "",
       address: trader.address || "",
       opening_balance: String(trader.opening_balance || "0"),
-      types: trader.types ? trader.types.split(", ").filter(Boolean) : []
+      types: trader.types ? trader.types.split(", ").filter(Boolean) : [],
+      carried_from_year: trader.carried_from_year || null
     })
     setShowAddTraderModal(true)
   }
@@ -503,6 +507,13 @@ export default function Sales({ isReadOnly = false }) {
   // (same convention used in the printed ledger's opening-balance row)
   const openingBalance = Number(activeTraderObj?.opening_balance || 0)
   const netBalance = totalCredit - totalDebit + openingBalance
+
+  const currentYearNum = activeYear || new Date().getFullYear()
+  const yearStartDate = `${currentYearNum}-01-01`
+  const displayedYearOpening = getPeriodOpeningBalance(activeTraderObj?.opening_balance, crossLedger, yearStartDate)
+
+  const monthStartDate = `${ledgerViewDate.year}-${String(ledgerViewDate.month + 1).padStart(2, "0")}-01`
+  const displayedMonthOpening = getPeriodOpeningBalance(activeTraderObj?.opening_balance, crossLedger, monthStartDate)
 
   // ── ledger table: search filter (existing) + month filter + grouping + pagination ──
   const ledgerSearchFiltered = crossLedger.filter(p => matchesMonth(p.date, ledgerSearch))
@@ -596,6 +607,22 @@ export default function Sales({ isReadOnly = false }) {
                   {netBalance >= 0 ? `${activeTraderObj?.name || 'Trader'} owes you` : `You owe ${activeTraderObj?.name || 'Trader'}`}
                 </div>
               </div>
+
+              {activeTraderObj && (
+                <div style={{ marginTop: 10, padding: "8px 12px", background: "#f8fafc", border: "1px solid #e2e8f0", borderRadius: 6, fontSize: 12, color: "#475569" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontWeight: 600 }}>Opening Balance:</span>
+                    <span style={{ fontWeight: 700, color: displayedYearOpening >= 0 ? "#0F6E56" : "#A32D2D" }}>
+                      ₹{Math.abs(displayedYearOpening).toLocaleString("en-IN")} {displayedYearOpening >= 0 ? "(Dr / Receivable)" : "(Cr / Payable)"}
+                    </span>
+                  </div>
+                  {Boolean(activeTraderObj?.carried_from_year) && (
+                    <div style={{ fontSize: 11, color: "#64748b", marginTop: 4, fontStyle: "italic" }}>
+                      Opening balance carried forward from {activeTraderObj.carried_from_year}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {!isReadOnly && activeTraderObj && (
                 <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
@@ -734,6 +761,13 @@ export default function Sales({ isReadOnly = false }) {
           />
         </div>
 
+        {activeTraderObj && (
+          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10, fontStyle: "italic" }}>
+            Opening Balance: ₹{Math.abs(displayedMonthOpening).toLocaleString("en-IN")} {displayedMonthOpening >= 0 ? "(Dr)" : "(Cr)"}
+            {activeTraderObj.carried_from_year ? ` — Opening balance carried forward from ${activeTraderObj.carried_from_year}` : ""}
+          </div>
+        )}
+
         {/* month nav (left) + page nav (right) */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 10 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
@@ -790,7 +824,32 @@ export default function Sales({ isReadOnly = false }) {
             </tr>
           </thead>
           <tbody>
-            {ledgerMonthFiltered.length === 0 ? (
+            {ledgerSafePage === 1 && displayedMonthOpening !== 0 && (
+              <tr style={{ background: "#fffbea", fontStyle: "italic" }}>
+                <td style={td}>—</td>
+                <td style={td}>
+                  <span style={{ background: "#f1f5f9", padding: "2px 6px", borderRadius: 4, fontSize: 11, color: "#475569" }}>
+                    —
+                  </span>
+                </td>
+                <td style={td}>
+                  <strong>Opening Balance</strong>
+                  {activeTraderObj?.carried_from_year && (
+                    <div style={{ fontSize: 10, color: "#64748b", fontStyle: "italic", fontWeight: "normal" }}>
+                      Opening balance carried forward from {activeTraderObj.carried_from_year}
+                    </div>
+                  )}
+                </td>
+                <td style={{ ...td, color: "#A32D2D" }}>
+                  {displayedMonthOpening < 0 ? `₹${Math.abs(displayedMonthOpening).toLocaleString("en-IN")}` : "—"}
+                </td>
+                <td style={{ ...td, color: "#0F6E56" }}>
+                  {displayedMonthOpening > 0 ? `₹${displayedMonthOpening.toLocaleString("en-IN")}` : "—"}
+                </td>
+                <td style={td}></td>
+              </tr>
+            )}
+            {ledgerMonthFiltered.length === 0 && (ledgerSafePage > 1 || displayedMonthOpening === 0) ? (
               <tr><td colSpan="6" style={{ ...td, textAlign: "center", color: "#aaa" }}>No transaction history logs selected.</td></tr>
             ) : (
               ledgerPageRows.map((p, i) => (
@@ -870,6 +929,11 @@ export default function Sales({ isReadOnly = false }) {
                   <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 3 }}>
                     Positive = trader owes you &nbsp;·&nbsp; Negative (e.g. -5000) = you owe trader
                   </div>
+                  {Boolean(traderForm.carried_from_year && editingTraderId) && (
+                    <div style={{ fontSize: 10, color: "#0F6E56", marginTop: 3, fontStyle: "italic" }}>
+                      Opening balance carried forward from {traderForm.carried_from_year}
+                    </div>
+                  )}
                 </div>
               </div>
 

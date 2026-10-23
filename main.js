@@ -15,8 +15,8 @@ function createWindow() {
     }
   })
 
-  if (app.isPackaged) {
-    // Production: load the built React files (no dev server available)
+  if (app.isPackaged || process.env.LAYER_ERP_USE_DIST === "1") {
+    // Production / Local Dist: load the built React files (no dev server available)
     win.loadFile(path.join(__dirname, "renderer/dist/index.html"))
   } else {
     // Development: load the Vite dev server
@@ -155,6 +155,26 @@ app.whenReady().then(() => {
 
   ipcMain.handle("feedIntake:balance", (_, batchId) =>
     db.getBatchFeedBalance(batchId)
+  )
+
+  // =====================================================
+  // FEED RETURNS
+  // =====================================================
+
+  ipcMain.handle("feedReturn:add", (_, data) =>
+    db.insertFeedReturn(data)
+  )
+
+  ipcMain.handle("feedReturn:getBatch", (_, batchId) =>
+    db.getFeedReturnsByBatch(batchId)
+  )
+
+  ipcMain.handle("feedReturn:update", (_, id, data) =>
+    db.updateFeedReturn(id, data)
+  )
+
+  ipcMain.handle("feedReturn:delete", (_, id) =>
+    db.deleteFeedReturn(id)
   )
 
   // =====================================================
@@ -371,6 +391,7 @@ app.whenReady().then(() => {
   ipcMain.handle("year:getActive",    ()       => db.getActiveYear())
   ipcMain.handle("year:getAvailable", ()       => db.getAvailableYears())
   ipcMain.handle("year:switch",       (_, yr)  => { db.switchYear(yr); return yr })
+  ipcMain.handle("year:backupBeforeUnlock", (_, yr) => db.backupBeforeUnlock(yr))
   ipcMain.handle("year:checkMigration",  (_, yr)         => db.checkMigrationNeeded(yr))
   ipcMain.handle("year:migrationPreview",(_, yr)         => db.getMigrationPreview(yr))
   ipcMain.handle("year:runMigration",    (_, fromYr, toYr) => db.runYearMigration(fromYr, toYr))

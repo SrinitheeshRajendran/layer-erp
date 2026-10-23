@@ -80,8 +80,15 @@ export default function App() {
     loadBatches()
   }
 
-  const handleUnlock = () => {
+  const handleUnlock = async () => {
     if (window.confirm(`You are about to edit ${activeYear} historical data. Are you sure?`)) {
+      if (window.api && window.api.backupBeforeUnlock) {
+        try {
+          await window.api.backupBeforeUnlock(activeYear)
+        } catch (err) {
+          console.warn("Backup before unlock warning:", err)
+        }
+      }
       setIsUnlocked(true)
     }
   }
@@ -101,7 +108,9 @@ export default function App() {
       })
     } catch(e) {
       console.error("Migration failed:", e)
-      alert("Migration failed: " + e.message)
+      const raw = e?.message || String(e)
+      const clean = raw.replace(/^Error:\s*Error invoking remote method '[^']+':\s*/i, "")
+      alert(clean)
     } finally {
       setMigrating(false)
     }
@@ -239,7 +248,7 @@ export default function App() {
 
     if (page === "dailyReport") return <DailyReport />
     if (page === "medication") return <MedicationPage isReadOnly={isReadOnly} />
-    if (page === "sales") return <Sales isReadOnly={isReadOnly} />
+    if (page === "sales") return <Sales isReadOnly={isReadOnly} activeYear={activeYear} />
     if (page === "ledger") return <AccountLedger isReadOnly={isReadOnly} />
     if (page === "finance") return <FinanceExpenses isReadOnly={isReadOnly} />
 
@@ -631,8 +640,7 @@ export default function App() {
               📦 Year End — Move to {currentYear}
             </div>
             <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 20 }}>
-              Active batches from {currentYear - 1} will be moved with full history.
-              Traders will carry forward their closing balance as opening balance.
+              Active batches from {currentYear - 1} will be moved with full history. Traders will carry forward their closing balance.
             </div>
 
             {/* Active Batches */}
@@ -661,7 +669,7 @@ export default function App() {
                     <div key={t.id} style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #f0f0f0", fontSize: 13 }}>
                       <span style={{ color: "#333" }}>{t.name}</span>
                       <span style={{ fontWeight: 600, color: t.closing_balance >= 0 ? "#0F6E56" : "#B91C1C" }}>
-                        ₹{Number(t.closing_balance).toLocaleString()}
+                        {t.closing_balance < 0 ? "-" : ""}₹{Math.abs(Number(t.closing_balance || 0)).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </span>
                     </div>
                   ))}

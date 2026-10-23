@@ -74,6 +74,18 @@ contextBridge.exposeInMainWorld("api", {
   getBatchFeedBalance: (batchId) =>
     ipcRenderer.invoke("feedIntake:balance", batchId),
 
+  insertFeedReturn: (data) =>
+    ipcRenderer.invoke("feedReturn:add", data),
+
+  getFeedReturnsByBatch: (batchId) =>
+    ipcRenderer.invoke("feedReturn:getBatch", batchId),
+
+  updateFeedReturn: (id, data) =>
+    ipcRenderer.invoke("feedReturn:update", id, data),
+
+  deleteFeedReturn: (id) =>
+    ipcRenderer.invoke("feedReturn:delete", id),
+
   insertMortalityLog: (data) =>
     ipcRenderer.invoke("mortality:add", data),
 
@@ -210,6 +222,7 @@ contextBridge.exposeInMainWorld("api", {
   getActiveYear:    ()    => ipcRenderer.invoke("year:getActive"),
   getAvailableYears:()    => ipcRenderer.invoke("year:getAvailable"),
   switchYear:        (yr)           => ipcRenderer.invoke("year:switch", yr),
+  backupBeforeUnlock:(yr)           => ipcRenderer.invoke("year:backupBeforeUnlock", yr),
   checkMigration:      (yr)          => ipcRenderer.invoke("year:checkMigration", yr),
   getMigrationPreview: (yr)          => ipcRenderer.invoke("year:migrationPreview", yr),
   runMigration:        (fromYr, toYr)=> ipcRenderer.invoke("year:runMigration", fromYr, toYr)
