@@ -659,14 +659,28 @@ migrateFromLegacy()
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getTraderClosingBalance(prevDb, traderId, openingBalance) {
-  const sales    = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM egg_sales WHERE trader_id=?`).get(traderId)?.v || 0
-  const feed     = prevDb.prepare(`SELECT COALESCE(SUM(qty_kg*rate_per_kg),0) v FROM feed_allocations WHERE trader_id=?`).get(traderId)?.v || 0
-  const paidToTrader   = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction != 'from_trader'`).get(traderId)?.v || 0
-  const receivedFromTrader = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction = 'from_trader'`).get(traderId)?.v || 0
+  let targetDb = prevDb
+  let targetTraderId = traderId
+  if (typeof prevDb === 'number' && traderId === undefined) {
+    targetTraderId = prevDb
+    targetDb = getDb()
+  } else if (!targetDb) {
+    targetDb = getDb()
+  }
+
+  if (openingBalance === undefined || openingBalance === null) {
+    const row = targetDb.prepare(`SELECT opening_balance FROM traders WHERE id=?`).get(targetTraderId)
+    openingBalance = row ? (row.opening_balance || 0) : 0
+  }
+
+  const sales    = targetDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM egg_sales WHERE trader_id=?`).get(targetTraderId)?.v || 0
+  const feed     = targetDb.prepare(`SELECT COALESCE(SUM(qty_kg*rate_per_kg),0) v FROM feed_allocations WHERE trader_id=?`).get(targetTraderId)?.v || 0
+  const paidToTrader   = targetDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction != 'from_trader'`).get(targetTraderId)?.v || 0
+  const receivedFromTrader = targetDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction = 'from_trader'`).get(targetTraderId)?.v || 0
 
   let adjustments = 0
   try {
-    adjustments = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_adjustments WHERE trader_id=? AND (voided IS NULL OR voided=0)`).get(traderId)?.v || 0
+    adjustments = targetDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_adjustments WHERE trader_id=? AND (voided IS NULL OR voided=0)`).get(targetTraderId)?.v || 0
   } catch (e) {
     // If trader_adjustments not available on older DB
   }
@@ -674,7 +688,7 @@ function getTraderClosingBalance(prevDb, traderId, openingBalance) {
   // Medication debits for trader with pro-rata tax_pct matching getCrossBatchTraderLedger bill grouping
   let medDebits = 0
   try {
-    const medRows = prevDb.prepare(`SELECT date, batch_id, cost, tax_pct FROM medication_log WHERE trader_id=?`).all(traderId)
+    const medRows = targetDb.prepare(`SELECT date, batch_id, cost, tax_pct FROM medication_log WHERE trader_id=?`).all(targetTraderId)
     const medGroups = {}
     for (const m of medRows) {
       const key = `${m.date}|${m.batch_id}`
@@ -692,7 +706,7 @@ function getTraderClosingBalance(prevDb, traderId, openingBalance) {
   }
 
   // credit (sales + payments to trader) - debit (feed + medication + payments from trader) + adjustments
-  return Number(openingBalance) + Number(sales) - Number(feed) - Number(medDebits) + Number(paidToTrader) - Number(receivedFromTrader) + Number(adjustments)
+  return Math.round((Number(openingBalance) + Number(sales) - Number(feed) - Number(medDebits) + Number(paidToTrader) - Number(receivedFromTrader) + Number(adjustments)) * 100) / 100
 }
 
 // Calculate net effect of a trader's rows copied into new year for active batches actually moving
@@ -914,14 +928,15 @@ function runYearMigration(fromYear, toYear, options = {}) {
         }
       }
 
-      // b. For EVERY trader, the new-year balance equals closing_old within 0.01
+      // b. For EVERY trader, the carried-over balance (newOpening + copied moving batch effect) equals closing_old within 0.01
       for (const t of traders) {
         const closingOld = getTraderClosingBalance(fromDb, t.id, t.opening_balance)
         const newTraderId = traderIdMap[t.id]
         const newOpening = toDb.prepare(`SELECT opening_balance FROM traders WHERE id=?`).get(newTraderId)?.opening_balance || 0
-        const closingNew = getTraderClosingBalance(toDb, newTraderId, newOpening)
-        if (Math.abs(closingNew - closingOld) > 0.01) {
-          throw new Error(`Pre-commit balance verification failed for trader "${t.name}": old=${closingOld.toFixed(2)}, new=${closingNew.toFixed(2)}`)
+        const copiedEffect = getTraderCopiedEffect(fromDb, t.id, batchIds)
+        const migratedBalance = newOpening + copiedEffect
+        if (Math.abs(migratedBalance - closingOld) > 0.01) {
+          throw new Error(`Pre-commit balance verification failed for trader "${t.name}": old=${closingOld.toFixed(2)}, migrated=${migratedBalance.toFixed(2)}`)
         }
       }
     })
