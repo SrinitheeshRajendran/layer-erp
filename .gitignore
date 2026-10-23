@@ -8,8 +8,16 @@ release/
 dist/
 out/
 
+# Database files & backups
+*.db
+*.db-wal
+*.db-shm
+backups/
+
 # Logs
 *.log
+crash.log
+packaged_out.log
 
 # IDE
 .vscode/
@@ -17,3 +25,7 @@ out/
 
 # Environment
 .env
+
+# Screenshots
+screenshot*.png
+screen_test.png
