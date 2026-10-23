@@ -3,6 +3,16 @@ const path = require('path')
 const fs = require('fs')
 const Database = require('better-sqlite3')
 
+function getUserDataPath() {
+  if (process.env.LAYER_ERP_DATA_DIR) {
+    return process.env.LAYER_ERP_DATA_DIR
+  }
+  if (app) {
+    return app.getPath('userData')
+  }
+  return path.join(process.env.APPDATA || path.join(process.env.HOME || '', '.config'), 'layer-erp')
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // YEARLY DATABASE — one .db file per financial year
 // e.g. layererp-2026.db, layererp-2027.db ...
@@ -13,20 +23,25 @@ let activeYear = new Date().getFullYear()
 let db = null
 
 function getDbPath(year) {
-  return path.join(app.getPath('userData'), `layererp-${year}.db`)
+  return path.join(getUserDataPath(), `layererp-${year}.db`)
 }
 
 function getDb(year) {
   const yr = year || activeYear
-  // If same year already open, return it
-  if (db && db.__year === yr) return db
-
-  // Close previous connection if switching year
-  if (db) { db.close(); db = null }
-
   const dbPath = getDbPath(yr)
+  // If same year and path already open, return it
+  if (db && db.__year === yr && db.__path === dbPath) return db
+
+  // Close previous connection if switching year or path
+  if (db) { try { db.close() } catch (e) {} db = null }
+
+  const dir = path.dirname(dbPath)
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true })
+  }
   db = new Database(dbPath)
   db.__year = yr
+  db.__path = dbPath
 
   // WAL mode — much faster writes, safe on crash
   db.pragma('journal_mode = WAL')
@@ -36,9 +51,104 @@ function getDb(year) {
   return db
 }
 
+function backupDatabaseFiles(label = '') {
+  try {
+    const userData = getUserDataPath()
+    if (!fs.existsSync(userData)) return null
+
+    // If an active DB connection is open, checkpoint its WAL so disk files are 100% current
+    if (db) {
+      try {
+        db.pragma('wal_checkpoint(TRUNCATE)')
+      } catch (e) {
+        console.warn('[Database] WAL checkpoint before backup:', e)
+      }
+    }
+
+    const now = new Date()
+    const pad = (n) => String(n).padStart(2, '0')
+    const timestamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+    const isMigration = label.startsWith('migration')
+    const folderName = isMigration
+      ? `backup_${label}_${timestamp}`
+      : (label ? `backup_${label}_${timestamp}` : `backup_${timestamp}`)
+    const backupDir = path.join(userData, 'backups', folderName)
+
+    const files = fs.readdirSync(userData).filter(f => f.endsWith('.db') || f.endsWith('.db-wal') || f.endsWith('.db-shm'))
+    if (files.length === 0) return null
+
+    fs.mkdirSync(backupDir, { recursive: true })
+    let totalBytes = 0
+    for (const f of files) {
+      const src = path.join(userData, f)
+      if (fs.statSync(src).isFile()) {
+        const dest = path.join(backupDir, f)
+        fs.copyFileSync(src, dest)
+        totalBytes += fs.statSync(dest).size
+      }
+    }
+    const kbUsed = (totalBytes / 1024).toFixed(2)
+    console.log(`[Database] Created automatic backup at ${backupDir} (${kbUsed} KB)`)
+
+    // Prune backups: Keep last 3 migration backups and last 5 general backups separately.
+    // General pruning must NEVER prune migration backups.
+    const backupsParent = path.join(userData, 'backups')
+    if (fs.existsSync(backupsParent)) {
+      const allDirs = fs.readdirSync(backupsParent, { withFileTypes: true })
+        .filter(d => d.isDirectory() && d.name.startsWith('backup_'))
+        .map(d => {
+          const fullPath = path.join(backupsParent, d.name)
+          return { name: d.name, path: fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs }
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+
+      const migrationDirs = allDirs.filter(d => d.name.startsWith('backup_migration'))
+      const generalDirs = allDirs.filter(d => !d.name.startsWith('backup_migration'))
+
+      // Keep only 3 most recent migration backups
+      if (migrationDirs.length > 3) {
+        for (let i = 3; i < migrationDirs.length; i++) {
+          try {
+            fs.rmSync(migrationDirs[i].path, { recursive: true, force: true })
+            console.log(`[Database] Pruned old migration backup folder: ${migrationDirs[i].name}`)
+          } catch (e) {
+            console.warn(`[Database] Failed to prune old migration backup ${migrationDirs[i].name}:`, e)
+          }
+        }
+      }
+
+      // Keep only 5 most recent general backups
+      if (generalDirs.length > 5) {
+        for (let i = 5; i < generalDirs.length; i++) {
+          try {
+            fs.rmSync(generalDirs[i].path, { recursive: true, force: true })
+            console.log(`[Database] Pruned old general backup folder: ${generalDirs[i].name}`)
+          } catch (e) {
+            console.warn(`[Database] Failed to prune old general backup ${generalDirs[i].name}:`, e)
+          }
+        }
+      }
+    }
+
+    return backupDir
+  } catch (err) {
+    console.error('[Database] Automatic backup failed:', err)
+    return null
+  }
+}
+
 function switchYear(year) {
+  if (db) {
+    try { db.close() } catch (e) {}
+    db = null
+  }
+  // Plain year switch for read-only viewing: DO NOT create a full backup here.
   activeYear = year
-  db = null // force reconnect on next call
+}
+
+function backupBeforeUnlock(year) {
+  console.log(`[Database] Backing up before unlocking year ${year} for editing...`)
+  return backupDatabaseFiles(`unlock_${year}`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,7 +211,8 @@ function initSchema(d) {
       address TEXT,
       opening_balance REAL DEFAULT 0,
       types TEXT DEFAULT '',
-      notes TEXT
+      notes TEXT,
+      carried_from_year INTEGER
     );
 
     ----------------------------------------------------------------
@@ -132,6 +243,7 @@ function initSchema(d) {
       amount REAL DEFAULT 0,
       mode TEXT DEFAULT 'Cash',
       notes TEXT,
+      direction TEXT DEFAULT 'to_trader',
       FOREIGN KEY(trader_id) REFERENCES traders(id)
     );
 
@@ -229,6 +341,8 @@ function initSchema(d) {
       notes TEXT,
       route TEXT,
       administered_by TEXT,
+      tax_pct REAL DEFAULT 0,
+      particulars TEXT,
       FOREIGN KEY(supplier_id) REFERENCES medical_suppliers(id)
     );
 
@@ -238,7 +352,8 @@ function initSchema(d) {
       form_type TEXT DEFAULT 'Powder',
       num_packs REAL DEFAULT 0,
       qty_per_pack REAL DEFAULT 0,
-      price_per_pack REAL DEFAULT 0
+      price_per_pack REAL DEFAULT 0,
+      qty_unit TEXT
     );
 
     ----------------------------------------------------------------
@@ -311,6 +426,7 @@ function initSchema(d) {
     "ALTER TABLE flocks ADD COLUMN initial_age_days INTEGER DEFAULT 0",
     "ALTER TABLE flocks ADD COLUMN free_chicks INTEGER DEFAULT 0",
     "ALTER TABLE traders ADD COLUMN types TEXT DEFAULT ''",
+    "ALTER TABLE traders ADD COLUMN carried_from_year INTEGER",
     "ALTER TABLE feed_allocations ADD COLUMN trader_id INTEGER",
     "ALTER TABLE medication_log ADD COLUMN trader_id INTEGER",
     "ALTER TABLE medication_log ADD COLUMN type TEXT DEFAULT 'Support Medicine'",
@@ -320,7 +436,7 @@ function initSchema(d) {
     "ALTER TABLE medication_log ADD COLUMN particulars TEXT",
     "ALTER TABLE medication_pack_details ADD COLUMN qty_unit TEXT",
     "ALTER TABLE trader_payments ADD COLUMN direction TEXT DEFAULT 'to_trader'",
-    "ALTER TABLE egg_sales ADD COLUMN broken_qty REAL DEFAULT 0",
+    "ALTER TABLE egg_sales ADD COLUMN broken_qty REAL DEFAULT 0"
   ]
   for (const sql of migrations) {
     try { d.exec(sql) } catch (e) { /* column already exists, skip */ }
@@ -332,8 +448,6 @@ function initSchema(d) {
 
   // One-time: broken-egg tracking moved from egg_production to egg_sales
   // (breakage is discovered/sorted during sales, not during production).
-  // Drop the now-unused egg_production.broken_eggs column; old values are
-  // intentionally not carried over — re-log historical breakage via Sale Entry.
   dropProductionBrokenEggsColumn(d)
 
   // Indexes for fast queries as data grows
@@ -483,12 +597,7 @@ function getMigrationPreview(prevYear) {
 
   // Traders with their closing balance
   const traders = prev.prepare(`SELECT * FROM traders`).all().map(t => {
-    const sales    = prev.prepare(`SELECT COALESCE(SUM(amount),0) total FROM egg_sales WHERE trader_id=?`).get(t.id)?.total || 0
-    const feed     = prev.prepare(`SELECT COALESCE(SUM(qty_kg * rate_per_kg),0) total FROM feed_allocations WHERE trader_id=?`).get(t.id)?.total || 0
-    const paidToTrader   = prev.prepare(`SELECT COALESCE(SUM(amount),0) total FROM trader_payments WHERE trader_id=? AND direction != 'from_trader'`).get(t.id)?.total || 0
-    const receivedFromTrader = prev.prepare(`SELECT COALESCE(SUM(amount),0) total FROM trader_payments WHERE trader_id=? AND direction = 'from_trader'`).get(t.id)?.total || 0
-    const closing  = Number(t.opening_balance || 0) + Number(sales) - Number(feed) - Number(paidToTrader) + Number(receivedFromTrader)
-    return { ...t, closing_balance: closing }
+    return { ...t, closing_balance: getTraderClosingBalance(prev, t.id, t.opening_balance) }
   })
 
   prev.close()
@@ -501,7 +610,7 @@ function getMigrationPreview(prevYear) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function migrateFromLegacy() {
-  const legacyPath = path.join(app.getPath('userData'), 'layererp.db')
+  const legacyPath = path.join(getUserDataPath(), 'layererp.db')
   const newPath = getDbPath(activeYear)
 
   if (fs.existsSync(legacyPath) && !fs.existsSync(newPath)) {
@@ -525,8 +634,60 @@ function getTraderClosingBalance(prevDb, traderId, openingBalance) {
   const feed     = prevDb.prepare(`SELECT COALESCE(SUM(qty_kg*rate_per_kg),0) v FROM feed_allocations WHERE trader_id=?`).get(traderId)?.v || 0
   const paidToTrader   = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction != 'from_trader'`).get(traderId)?.v || 0
   const receivedFromTrader = prevDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM trader_payments WHERE trader_id=? AND direction = 'from_trader'`).get(traderId)?.v || 0
-  // credit (sales) - debit (feed) - payments we made to trader + payments trader made to us
-  return Number(openingBalance) + Number(sales) - Number(feed) - Number(paidToTrader) + Number(receivedFromTrader)
+
+  // Medication debits for trader with pro-rata tax_pct matching getCrossBatchTraderLedger bill grouping
+  let medDebits = 0
+  try {
+    const medRows = prevDb.prepare(`SELECT date, batch_id, cost, tax_pct FROM medication_log WHERE trader_id=?`).all(traderId)
+    const medGroups = {}
+    for (const m of medRows) {
+      const key = `${m.date}|${m.batch_id}`
+      if (!medGroups[key]) {
+        medGroups[key] = { debit: 0, taxPct: Number(m.tax_pct || 0) }
+      }
+      medGroups[key].debit += Number(m.cost || 0)
+    }
+    for (const g of Object.values(medGroups)) {
+      const taxAmt = g.debit * g.taxPct / 100
+      medDebits += Math.round(g.debit + taxAmt)
+    }
+  } catch (e) {
+    // If medication_log or tax_pct not available on older DB
+  }
+
+  // credit (sales + payments to trader) - debit (feed + medication + payments from trader)
+  return Number(openingBalance) + Number(sales) - Number(feed) - Number(medDebits) + Number(paidToTrader) - Number(receivedFromTrader)
+}
+
+// Calculate net effect of a trader's rows copied into new year for active batches actually moving
+function getTraderCopiedEffect(fromDb, traderId, movingBatchIds) {
+  if (!movingBatchIds || movingBatchIds.length === 0) return 0
+  const marks = movingBatchIds.map(() => '?').join(',')
+
+  const sales = fromDb.prepare(`SELECT COALESCE(SUM(amount),0) v FROM egg_sales WHERE trader_id=? AND batch_id IN (${marks})`).get(traderId, ...movingBatchIds)?.v || 0
+  const feed  = fromDb.prepare(`SELECT COALESCE(SUM(qty_kg*rate_per_kg),0) v FROM feed_allocations WHERE trader_id=? AND batch_id IN (${marks})`).get(traderId, ...movingBatchIds)?.v || 0
+
+  let medDebits = 0
+  try {
+    const medRows = fromDb.prepare(`SELECT date, batch_id, cost, tax_pct FROM medication_log WHERE trader_id=? AND batch_id IN (${marks})`).all(traderId, ...movingBatchIds)
+    const medGroups = {}
+    for (const m of medRows) {
+      const key = `${m.date}|${m.batch_id}`
+      if (!medGroups[key]) {
+        medGroups[key] = { debit: 0, taxPct: Number(m.tax_pct || 0) }
+      }
+      medGroups[key].debit += Number(m.cost || 0)
+    }
+    for (const g of Object.values(medGroups)) {
+      const taxAmt = g.debit * g.taxPct / 100
+      medDebits += Math.round(g.debit + taxAmt)
+    }
+  } catch (e) {
+    // If medication_log or tax_pct not available on older DB
+  }
+
+  // copied_effect = copied egg_sales amounts - copied feed_allocations (qty*rate) - copied medication (with tax)
+  return Number(sales) - Number(feed) - Number(medDebits)
 }
 
 function checkMigrationNeeded(fromYear) {
@@ -550,22 +711,23 @@ function checkMigrationNeeded(fromYear) {
   }
 }
 
-function runYearMigration(fromYear, toYear) {
+function runYearMigration(fromYear, toYear, options = {}) {
+  const backupDir = backupDatabaseFiles(`migration_${fromYear}_to_${toYear}`)
   const fromPath = getDbPath(fromYear)
   const toPath   = getDbPath(toYear)
 
-  if (!fs.existsSync(fromPath)) throw new Error(`Source DB layererp-${fromYear}.db not found`)
+  if (!fs.existsSync(fromPath)) {
+    throw new Error(`Migration failed, no data was changed. A backup is at ${backupDir}. Detail: Source DB layererp-${fromYear}.db not found`)
+  }
 
   // Open both DBs
   const fromDb = new Database(fromPath)
   fromDb.pragma('journal_mode = WAL')
   fromDb.pragma('foreign_keys = OFF')
-  // Bring the source DB's schema up to date (e.g. legacy double-yolk columns
-  // folded into their own rows) before we read/copy from it
   initSchema(fromDb)
 
-  // Make sure toYear DB exists with schema
   const toDb = getDb(toYear)
+  toDb.pragma('foreign_keys = OFF')
 
   // Get active batches from source
   const activeBatches = fromDb.prepare(`SELECT * FROM flocks WHERE status != 'Closed'`).all()
@@ -575,103 +737,201 @@ function runYearMigration(fromYear, toYear) {
   }
 
   const batchIds = activeBatches.map(b => b.batch_id)
-  const placeholders = batchIds.map(() => '?').join(',')
-
-  // ── Copy traders with closing balance as new opening balance ──
-  const traders = fromDb.prepare(`SELECT * FROM traders`).all()
   const traderIdMap = {} // old id → new id in toYear DB
 
-  for (const t of traders) {
-    const closingBal = getTraderClosingBalance(fromDb, t.id, t.opening_balance)
-    // Check if trader already exists in toYear DB
-    const existing = toDb.prepare(`SELECT id FROM traders WHERE name=?`).get(t.name)
-    if (existing) {
-      traderIdMap[t.id] = existing.id
-      toDb.prepare(`UPDATE traders SET opening_balance=?, phone=?, address=?, types=?, notes=? WHERE id=?`)
-        .run(closingBal, t.phone||'', t.address||'', t.types||'', t.notes||'', existing.id)
+  const tablesToCopy = [
+    { table: 'egg_production', cols: ['date','batch_id','pullet_trays','medium_trays','correct_size_trays','export_trays','large_trays','double_yolk_eggs'] },
+    { table: 'egg_sales', cols: ['date','batch_id','trader_id','grade','quantity','unit_type','rate_per_egg','amount','broken_qty','notes'] },
+    { table: 'feed_allocations', cols: ['date','batch_id','purchase_id','trader_id','feed_type','qty_kg','rate_per_kg','notes'] },
+    { table: 'feed_daily_intake', cols: ['date','batch_id','feed_type','qty_kg','notes'] },
+    { table: 'feed_returns', cols: ['date','batch_id','feed_type','qty_kg','notes'] },
+    { table: 'mortality_log', cols: ['date','batch_id','deaths','reason','notes'] },
+    { table: 'batch_expenses', cols: ['date','batch_id','expense_type','amount','notes'] },
+    { table: 'manure_sales', cols: ['date','batch_id','qty_kg','rate_per_kg','amount','buyer','notes'] }
+  ]
+
+  const verifiedBatchIds = []
+  let phaseACommitted = false
+
+  try {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PHASE A: ONE transaction on the new-year DB (toDb)
+    // ═══════════════════════════════════════════════════════════════════════════
+    const phaseA = toDb.transaction(() => {
+      // 1. Upsert traders inside the Phase A transaction
+      const traders = fromDb.prepare(`SELECT * FROM traders`).all()
+      for (const t of traders) {
+        const closingOld = getTraderClosingBalance(fromDb, t.id, t.opening_balance)
+        const copiedEffect = getTraderCopiedEffect(fromDb, t.id, batchIds)
+        const openingNew = closingOld - copiedEffect
+
+        const existing = toDb.prepare(`SELECT id FROM traders WHERE name=?`).get(t.name)
+        if (existing) {
+          traderIdMap[t.id] = existing.id
+          toDb.prepare(`UPDATE traders SET opening_balance=?, phone=?, address=?, types=?, carried_from_year=? WHERE id=?`)
+            .run(openingNew, t.phone || '', t.address || '', t.types || '', fromYear, existing.id)
+        } else {
+          const info = toDb.prepare(`INSERT INTO traders (name, phone, address, opening_balance, types, notes, carried_from_year) VALUES (?,?,?,?,?,?,?)`)
+            .run(t.name, t.phone || '', t.address || '', openingNew, t.types || '', t.notes || '', fromYear)
+          traderIdMap[t.id] = info.lastInsertRowid
+        }
+      }
+
+      // 2. Process active batches
+      for (const batch of activeBatches) {
+        const bid = batch.batch_id
+        const existingFlock = toDb.prepare(`SELECT id FROM flocks WHERE batch_id=?`).get(bid)
+
+        if (existingFlock) {
+          // Flock already exists in new file: do NOT silently delete source rows.
+          // Run the same count verification between the two files.
+          for (const item of tablesToCopy) {
+            const srcCount = fromDb.prepare(`SELECT COUNT(*) c FROM ${item.table} WHERE batch_id=?`).get(bid).c
+            const dstCount = toDb.prepare(`SELECT COUNT(*) c FROM ${item.table} WHERE batch_id=?`).get(bid).c
+            if (srcCount !== dstCount) {
+              throw new Error(`Flock ${bid} already exists in ${toYear} with differing row counts for ${item.table} (source: ${srcCount}, target: ${dstCount}). Migration aborted.`)
+            }
+          }
+          const srcMeds = fromDb.prepare(`SELECT COUNT(*) c FROM medication_log WHERE batch_id=?`).get(bid).c
+          const dstMeds = toDb.prepare(`SELECT COUNT(*) c FROM medication_log WHERE batch_id=?`).get(bid).c
+          if (srcMeds !== dstMeds) {
+            throw new Error(`Flock ${bid} already exists in ${toYear} with differing row counts for medication_log (source: ${srcMeds}, target: ${dstMeds}). Migration aborted.`)
+          }
+          const srcPacks = fromDb.prepare(`SELECT COUNT(*) c FROM medication_pack_details WHERE medication_id IN (SELECT id FROM medication_log WHERE batch_id=?)`).get(bid).c
+          const dstPacks = toDb.prepare(`SELECT COUNT(*) c FROM medication_pack_details WHERE medication_id IN (SELECT id FROM medication_log WHERE batch_id=?)`).get(bid).c
+          if (srcPacks !== dstPacks) {
+            throw new Error(`Flock ${bid} already exists in ${toYear} with differing medication_pack_details counts (source: ${srcPacks}, target: ${dstPacks}). Migration aborted.`)
+          }
+
+          // Counts match: treat it as a completed copy and mark for Phase B purge
+          verifiedBatchIds.push(bid)
+          continue
+        }
+
+        // New flock: insert flock and copy rows
+        toDb.prepare(`INSERT INTO flocks (batch_id, shed, breed, start_date, initial_age_days, start_count, current_count, free_chicks, cost_per_chick, status)
+          VALUES (?,?,?,?,?,?,?,?,?,?)`)
+          .run(bid, batch.shed || '', batch.breed || '', batch.start_date, batch.initial_age_days || 0,
+               batch.start_count || 0, batch.current_count || 0, batch.free_chicks || 0, batch.cost_per_chick || 0, 'Active')
+
+        for (const item of tablesToCopy) {
+          const rows = fromDb.prepare(`SELECT * FROM ${item.table} WHERE batch_id=? ORDER BY id`).all(bid)
+          for (const row of rows) {
+            const mappedRow = { ...row }
+            if ('trader_id' in mappedRow && mappedRow.trader_id) {
+              mappedRow.trader_id = traderIdMap[mappedRow.trader_id] || mappedRow.trader_id
+            }
+            const colList = item.cols.join(',')
+            const vals    = item.cols.map(c => mappedRow[c] ?? null)
+            const marks   = item.cols.map(() => '?').join(',')
+            toDb.prepare(`INSERT INTO ${item.table} (${colList}) VALUES (${marks})`).run(...vals)
+          }
+        }
+
+        // Medication and pack details
+        const meds = fromDb.prepare(`SELECT * FROM medication_log WHERE batch_id=? ORDER BY id`).all(bid)
+        for (const med of meds) {
+          const newTraderId = med.trader_id ? (traderIdMap[med.trader_id] || med.trader_id) : null
+          const info = toDb.prepare(`INSERT INTO medication_log
+            (date,batch_id,trader_id,type,medicine,dose,cost,notes,route,administered_by,tax_pct,particulars)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+            .run(med.date, bid, newTraderId, med.type || '', med.medicine || '',
+                 med.dose || '', med.cost || 0, med.notes || '', med.route || '', med.administered_by || '',
+                 Number(med.tax_pct || 0), med.particulars || '')
+          if (info.changes > 0) {
+            const packs = fromDb.prepare(`SELECT * FROM medication_pack_details WHERE medication_id=?`).all(med.id)
+            for (const p of packs) {
+              toDb.prepare(`INSERT INTO medication_pack_details (medication_id,form_type,num_packs,qty_per_pack,price_per_pack,qty_unit)
+                VALUES (?,?,?,?,?,?)`)
+                .run(info.lastInsertRowid, p.form_type, p.num_packs, p.qty_per_pack, p.price_per_pack, p.qty_unit || null)
+            }
+          }
+        }
+
+        verifiedBatchIds.push(bid)
+      }
+
+      // Test failure injection in the middle of Phase A before verification/commit
+      if (options.testInjectPhaseAFail) {
+        throw new Error('Test injected failure in Phase A transaction')
+      }
+
+      // 3. Pre-commit VERIFY inside Phase A transaction:
+      // a. For every moving batch and every copied table, row count in new file == row count in old file
+      for (const bid of verifiedBatchIds) {
+        for (const item of tablesToCopy) {
+          const srcCount = fromDb.prepare(`SELECT COUNT(*) c FROM ${item.table} WHERE batch_id=?`).get(bid).c
+          const dstCount = toDb.prepare(`SELECT COUNT(*) c FROM ${item.table} WHERE batch_id=?`).get(bid).c
+          if (srcCount !== dstCount) {
+            throw new Error(`Pre-commit verification failed: row count mismatch for batch ${bid} in ${item.table} (source: ${srcCount}, target: ${dstCount})`)
+          }
+        }
+        const srcMeds = fromDb.prepare(`SELECT COUNT(*) c FROM medication_log WHERE batch_id=?`).get(bid).c
+        const dstMeds = toDb.prepare(`SELECT COUNT(*) c FROM medication_log WHERE batch_id=?`).get(bid).c
+        if (srcMeds !== dstMeds) {
+          throw new Error(`Pre-commit verification failed: medication_log count mismatch for batch ${bid} (source: ${srcMeds}, target: ${dstMeds})`)
+        }
+        const srcPacks = fromDb.prepare(`SELECT COUNT(*) c FROM medication_pack_details WHERE medication_id IN (SELECT id FROM medication_log WHERE batch_id=?)`).get(bid).c
+        const dstPacks = toDb.prepare(`SELECT COUNT(*) c FROM medication_pack_details WHERE medication_id IN (SELECT id FROM medication_log WHERE batch_id=?)`).get(bid).c
+        if (srcPacks !== dstPacks) {
+          throw new Error(`Pre-commit verification failed: medication_pack_details count mismatch for batch ${bid} (source: ${srcPacks}, target: ${dstPacks})`)
+        }
+      }
+
+      // b. For EVERY trader, the new-year balance equals closing_old within 0.01
+      for (const t of traders) {
+        const closingOld = getTraderClosingBalance(fromDb, t.id, t.opening_balance)
+        const newTraderId = traderIdMap[t.id]
+        const newOpening = toDb.prepare(`SELECT opening_balance FROM traders WHERE id=?`).get(newTraderId)?.opening_balance || 0
+        const closingNew = getTraderClosingBalance(toDb, newTraderId, newOpening)
+        if (Math.abs(closingNew - closingOld) > 0.01) {
+          throw new Error(`Pre-commit balance verification failed for trader "${t.name}": old=${closingOld.toFixed(2)}, new=${closingNew.toFixed(2)}`)
+        }
+      }
+    })
+
+    // Commit Phase A
+    phaseA()
+    phaseACommitted = true
+
+    // Test failure injection in Phase B
+    if (options.testInjectPhaseBFail) {
+      throw new Error('Test injected failure in Phase B before source purge')
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PHASE B: ONLY after Phase A commits, delete moved rows from old-year file
+    // inside ONE transaction on fromDb, for the verified batches only
+    // ═══════════════════════════════════════════════════════════════════════════
+    const phaseB = fromDb.transaction(() => {
+      for (const bid of verifiedBatchIds) {
+        fromDb.prepare(`DELETE FROM medication_pack_details WHERE medication_id IN (SELECT id FROM medication_log WHERE batch_id=?)`).run(bid)
+        fromDb.prepare(`DELETE FROM medication_log    WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM egg_production    WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM egg_sales         WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM feed_allocations  WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM feed_daily_intake WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM feed_returns      WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM mortality_log     WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM batch_expenses    WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM manure_sales      WHERE batch_id=?`).run(bid)
+        fromDb.prepare(`DELETE FROM flocks            WHERE batch_id=? AND status != 'Closed'`).run(bid)
+      }
+    })
+
+    phaseB()
+    fromDb.close()
+
+    return { moved: verifiedBatchIds.length, traders: Object.keys(traderIdMap).length }
+  } catch (err) {
+    try { fromDb.close() } catch (e) {}
+    console.error('[Database] runYearMigration failed:', err.message)
+    if (typeof phaseACommitted !== 'undefined' && phaseACommitted) {
+      throw new Error(`Migration copied your data to ${toYear} but could not finish cleaning up ${fromYear}. Nothing was lost. Please run the migration again to complete it. A backup is at ${backupDir}. Detail: ${err.message}`)
     } else {
-      const info = toDb.prepare(`INSERT INTO traders (name, phone, address, opening_balance, types, notes) VALUES (?,?,?,?,?,?)`)
-        .run(t.name, t.phone||'', t.address||'', closingBal, t.types||'', t.notes||'')
-      traderIdMap[t.id] = info.lastInsertRowid
+      throw new Error(`Migration failed, no data was changed. A backup is at ${backupDir}. Detail: ${err.message}`)
     }
   }
-
-  // ── Move each active batch with full history ──
-  const migrate = toDb.transaction(() => {
-    for (const batch of activeBatches) {
-      const bid = batch.batch_id
-
-      // Insert flock into toYear (skip if already exists)
-      const existingFlock = toDb.prepare(`SELECT id FROM flocks WHERE batch_id=?`).get(bid)
-      if (!existingFlock) {
-        toDb.prepare(`INSERT INTO flocks (batch_id, shed, breed, start_date, initial_age_days, start_count, current_count, cost_per_chick, status)
-          VALUES (?,?,?,?,?,?,?,?,?)`)
-          .run(bid, batch.shed||'', batch.breed||'', batch.start_date, batch.initial_age_days||0,
-               batch.start_count||0, batch.current_count||0, batch.cost_per_chick||0, 'Active')
-      }
-
-      // Helper: copy table rows remapping trader_id
-      const copyTable = (table, cols, extraWhere='') => {
-        const rows = fromDb.prepare(`SELECT * FROM ${table} WHERE batch_id=? ${extraWhere} ORDER BY id`).all(bid)
-        for (const row of rows) {
-          const mappedRow = { ...row }
-          if ('trader_id' in mappedRow && mappedRow.trader_id) {
-            mappedRow.trader_id = traderIdMap[mappedRow.trader_id] || mappedRow.trader_id
-          }
-          const colList = cols.join(',')
-          const vals    = cols.map(c => mappedRow[c] ?? null)
-          const marks   = cols.map(() => '?').join(',')
-          toDb.prepare(`INSERT OR IGNORE INTO ${table} (${colList}) VALUES (${marks})`).run(...vals)
-        }
-        return rows.length
-      }
-
-      // Copy all batch-related tables
-      copyTable('egg_production',   ['date','batch_id','pullet_trays','medium_trays','correct_size_trays','export_trays','large_trays','double_yolk_eggs'])
-      copyTable('egg_sales',        ['date','batch_id','trader_id','grade','quantity','unit_type','rate_per_egg','amount','broken_qty','notes'])
-      copyTable('feed_allocations', ['date','batch_id','purchase_id','trader_id','feed_type','qty_kg','rate_per_kg','notes'])
-      copyTable('feed_daily_intake',['date','batch_id','feed_type','qty_kg','notes'])
-      copyTable('feed_returns',     ['date','batch_id','feed_type','qty_kg','notes'])
-      copyTable('mortality_log',    ['date','batch_id','deaths','reason','notes'])
-      copyTable('batch_expenses',   ['date','batch_id','expense_type','amount','notes'])
-
-      // Medication needs special handling for pack_details
-      const meds = fromDb.prepare(`SELECT * FROM medication_log WHERE batch_id=? ORDER BY id`).all(bid)
-      for (const med of meds) {
-        const newTraderId = med.trader_id ? (traderIdMap[med.trader_id] || med.trader_id) : null
-        const info = toDb.prepare(`INSERT OR IGNORE INTO medication_log
-          (date,batch_id,trader_id,type,medicine,dose,cost,notes,route,administered_by)
-          VALUES (?,?,?,?,?,?,?,?,?,?)`)
-          .run(med.date, bid, newTraderId, med.type||'', med.medicine||'',
-               med.dose||'', med.cost||0, med.notes||'', med.route||'', med.administered_by||'')
-        if (info.changes > 0) {
-          const packs = fromDb.prepare(`SELECT * FROM medication_pack_details WHERE medication_id=?`).all(med.id)
-          for (const p of packs) {
-            toDb.prepare(`INSERT INTO medication_pack_details (medication_id,form_type,num_packs,qty_per_pack,price_per_pack)
-              VALUES (?,?,?,?,?)`)
-              .run(info.lastInsertRowid, p.form_type, p.num_packs, p.qty_per_pack, p.price_per_pack)
-          }
-        }
-      }
-
-      // Delete from source DB
-      fromDb.prepare(`DELETE FROM medication_pack_details WHERE medication_id IN (SELECT id FROM medication_log WHERE batch_id=?)`).run(bid)
-      fromDb.prepare(`DELETE FROM medication_log    WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM egg_production    WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM egg_sales         WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM feed_allocations  WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM feed_daily_intake WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM feed_returns      WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM mortality_log     WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM batch_expenses    WHERE batch_id=?`).run(bid)
-      fromDb.prepare(`DELETE FROM flocks            WHERE batch_id=? AND status != 'Closed'`).run(bid)
-    }
-  })
-
-  migrate()
-  fromDb.close()
-
-  return { moved: activeBatches.length, traders: Object.keys(traderIdMap).length }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -680,11 +940,17 @@ function runYearMigration(fromYear, toYear) {
 
 module.exports = {
 
+  getDb,
+  closeDb: () => { if (db) { try { db.close() } catch(e){} db = null } },
+  initSchema,
+
   // Year management
   getActiveYear: () => activeYear,
   switchYear,
+  backupDatabaseFiles,
+  backupBeforeUnlock,
   getAvailableYears: () => {
-    const userData = app.getPath('userData')
+    const userData = getUserDataPath()
     return fs.readdirSync(userData)
       .filter(f => f.match(/^layererp-(\d{4})\.db$/))
       .map(f => parseInt(f.match(/(\d{4})/)[1]))
@@ -693,8 +959,10 @@ module.exports = {
 
   // Migration
   checkMigrationNeeded: (fromYear) => checkMigrationNeeded(fromYear),
-  runYearMigration: (fromYear, toYear) => runYearMigration(fromYear, toYear),
+  runYearMigration: (fromYear, toYear, options) => runYearMigration(fromYear, toYear, options),
   getMigrationPreview: (prevYear) => getMigrationPreview(prevYear),
+  getTraderClosingBalance: (prevDb, traderId, openingBalance) => getTraderClosingBalance(prevDb, traderId, openingBalance),
+  getTraderCopiedEffect: (db, traderId, movingBatchIds) => getTraderCopiedEffect(db, traderId, movingBatchIds),
 
   // ───────────────────────────────────────────────
   // BATCHES
@@ -771,6 +1039,7 @@ module.exports = {
       }
       d.prepare(`DELETE FROM medication_log    WHERE batch_id=?`).run(batchId)
       d.prepare(`DELETE FROM batch_expenses    WHERE batch_id=?`).run(batchId)
+      d.prepare(`DELETE FROM manure_sales      WHERE batch_id=?`).run(batchId)
       d.prepare(`DELETE FROM batch_closure     WHERE batch_id=?`).run(batchId)
       d.prepare(`DELETE FROM flocks            WHERE id=?`).run(id)
     })
@@ -786,8 +1055,8 @@ module.exports = {
   // ───────────────────────────────────────────────
 
   insertTrader: (data) => {
-    getDb().prepare(`INSERT INTO traders (name, phone, address, opening_balance, types, notes) VALUES (?,?,?,?,?,?)`)
-      .run(data.name, data.phone || "", data.address || "", Number(data.opening_balance || 0), data.types || "", data.notes || "")
+    getDb().prepare(`INSERT INTO traders (name, phone, address, opening_balance, types, notes, carried_from_year) VALUES (?,?,?,?,?,?,?)`)
+      .run(data.name, data.phone || "", data.address || "", Number(data.opening_balance || 0), data.types || "", data.notes || "", data.carried_from_year || null)
   },
 
   getTraders: () => {
@@ -795,8 +1064,13 @@ module.exports = {
   },
 
   updateTrader: (id, data) => {
-    getDb().prepare(`UPDATE traders SET name=?, phone=?, address=?, opening_balance=?, types=?, notes=? WHERE id=?`)
-      .run(data.name, data.phone, data.address, Number(data.opening_balance || 0), data.types, data.notes, id)
+    if ('carried_from_year' in data) {
+      getDb().prepare(`UPDATE traders SET name=?, phone=?, address=?, opening_balance=?, types=?, notes=?, carried_from_year=? WHERE id=?`)
+        .run(data.name, data.phone, data.address, Number(data.opening_balance || 0), data.types, data.notes, data.carried_from_year || null, id)
+    } else {
+      getDb().prepare(`UPDATE traders SET name=?, phone=?, address=?, opening_balance=?, types=?, notes=? WHERE id=?`)
+        .run(data.name, data.phone, data.address, Number(data.opening_balance || 0), data.types, data.notes, id)
+    }
   },
 
   deleteTrader: (id) => {
@@ -856,14 +1130,40 @@ module.exports = {
     const d = getDb()
     const allocated = d.prepare(`SELECT feed_type, SUM(qty_kg) total FROM feed_allocations WHERE batch_id=? GROUP BY feed_type`).all(batchId)
     const consumed  = d.prepare(`SELECT feed_type, SUM(qty_kg) total FROM feed_daily_intake WHERE batch_id=? GROUP BY feed_type`).all(batchId)
+    const returned  = d.prepare(`SELECT feed_type, SUM(qty_kg) total FROM feed_returns WHERE batch_id=? GROUP BY feed_type`).all(batchId)
     const consumedMap = {}
     consumed.forEach(r => consumedMap[r.feed_type] = Number(r.total))
+    const returnedMap = {}
+    returned.forEach(r => returnedMap[r.feed_type] = Number(r.total))
     return allocated.map(r => ({
       feed_type: r.feed_type,
       allocated: Number(r.total),
       consumed:  consumedMap[r.feed_type] || 0,
-      remaining: Number(r.total) - (consumedMap[r.feed_type] || 0)
+      returned:  returnedMap[r.feed_type] || 0,
+      remaining: Number(r.total) - (consumedMap[r.feed_type] || 0) - (returnedMap[r.feed_type] || 0)
     }))
+  },
+
+  // ───────────────────────────────────────────────
+  // FEED RETURNS
+  // ───────────────────────────────────────────────
+
+  insertFeedReturn: (data) => {
+    getDb().prepare(`INSERT INTO feed_returns (date, batch_id, feed_type, qty_kg, notes) VALUES (?,?,?,?,?)`)
+      .run(data.date, data.batch_id, data.feed_type, Number(data.qty_kg || 0), data.notes || "")
+  },
+
+  getFeedReturnsByBatch: (batchId) => {
+    return getDb().prepare(`SELECT * FROM feed_returns WHERE batch_id=? ORDER BY date DESC, id DESC`).all(batchId)
+  },
+
+  deleteFeedReturn: (id) => {
+    getDb().prepare(`DELETE FROM feed_returns WHERE id=?`).run(id)
+  },
+
+  updateFeedReturn: (id, data) => {
+    getDb().prepare(`UPDATE feed_returns SET date=?, feed_type=?, qty_kg=?, notes=? WHERE id=?`)
+      .run(data.date, data.feed_type, Number(data.qty_kg || 0), data.notes || "", id)
   },
 
   // Farm-level feed purchases
