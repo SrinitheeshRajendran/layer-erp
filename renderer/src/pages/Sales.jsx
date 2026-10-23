@@ -2,6 +2,16 @@ import { useState, useEffect } from "react"
 
 const fmtDate = d => d ? d.split("-").reverse().join("-") : ""
 
+const formatINR = (val) => {
+  const num = Number(val || 0)
+  const sign = num < 0 ? "-" : ""
+  const formatted = Math.abs(num).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })
+  return `${sign}₹${formatted}`
+}
+
 // Groups same-day, same-batch entries belonging to one "bill" into a single row:
 // - medication/vaccine lines merge with tax% applied + rounded to one Debit
 // - egg sale ("sale") lines merge into one Credit (no tax)
@@ -91,6 +101,25 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
   const [showPrintModal, setShowPrintModal] = useState(false)
   const [printFrom, setPrintFrom] = useState("")
   const [printTo,   setPrintTo]   = useState("")
+
+  // ── Trader adjustments & opening balance audit state ──
+  const [traderAdjustments, setTraderAdjustments] = useState([])
+  const [traderOpeningLogs, setTraderOpeningLogs] = useState([])
+  const [showAdjustmentModal, setShowAdjustmentModal] = useState(false)
+  const [adjConfirmStep, setAdjConfirmStep] = useState(false)
+  const [adjForm, setAdjForm] = useState({
+    date: today,
+    direction: "trader_owes_more",
+    amount: "",
+    note: ""
+  })
+  const [voidModalAdj, setVoidModalAdj] = useState(null)
+  const [voidReason, setVoidReason] = useState("")
+
+  // Opening balance change audit state for edit modal
+  const [originalOpeningBalance, setOriginalOpeningBalance] = useState("0")
+  const [openingBalanceReason, setOpeningBalanceReason] = useState("")
+  const [showOpeningConfirmModal, setShowOpeningConfirmModal] = useState(false)
 
   // ── month navigator + pagination (Unified Statement Ledger History) ──
   const PAGE_SIZE = 30
@@ -350,16 +379,41 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
 
   useEffect(() => { loadData() }, [])
 
+  const loadAdjustmentsAndLogs = async (traderId) => {
+    if (!traderId) {
+      setTraderAdjustments([])
+      setTraderOpeningLogs([])
+      return
+    }
+    try {
+      if (window.api.getTraderAdjustments) {
+        const adjs = await window.api.getTraderAdjustments(Number(traderId))
+        setTraderAdjustments(adjs || [])
+      }
+      if (window.api.getTraderOpeningLogs) {
+        const logs = await window.api.getTraderOpeningLogs(Number(traderId))
+        setTraderOpeningLogs(logs || [])
+      }
+    } catch (e) {
+      console.error("Failed to load adjustments or logs:", e)
+    }
+  }
+
   useEffect(() => {
-    if (selectedTrader && window.api.getCrossBatchTraderLedger) {
-      window.api.getCrossBatchTraderLedger(Number(selectedTrader)).then(data => {
-        setCrossLedger(data || [])
-      }).catch(err => {
-        console.error("Ledger query error:", err)
-        setCrossLedger([])
-      })
+    if (selectedTrader) {
+      loadAdjustmentsAndLogs(selectedTrader)
+      if (window.api.getCrossBatchTraderLedger) {
+        window.api.getCrossBatchTraderLedger(Number(selectedTrader)).then(data => {
+          setCrossLedger(data || [])
+        }).catch(err => {
+          console.error("Ledger query error:", err)
+          setCrossLedger([])
+        })
+      }
     } else {
       setCrossLedger([])
+      setTraderAdjustments([])
+      setTraderOpeningLogs([])
     }
   }, [selectedTrader])
 
@@ -367,6 +421,79 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
     if (traderId && window.api.getCrossBatchTraderLedger) {
       const data = await window.api.getCrossBatchTraderLedger(Number(traderId))
       setCrossLedger(data || [])
+    }
+  }
+
+  const handleOpenAddAdjustment = () => {
+    setAdjForm({
+      date: today,
+      direction: "trader_owes_more",
+      amount: "",
+      note: ""
+    })
+    setAdjConfirmStep(false)
+    setShowAdjustmentModal(true)
+  }
+
+  const handleReviewAdjustment = (e) => {
+    e?.preventDefault()
+    const amt = Number(adjForm.amount)
+    if (isNaN(amt) || amt <= 0) {
+      return notify("Enter a valid positive adjustment amount")
+    }
+    if (!adjForm.note || !adjForm.note.trim()) {
+      return notify("Adjustment note is required")
+    }
+    const currentYear = activeYear || new Date().getFullYear()
+    const adjYear = parseInt((adjForm.date || "").slice(0, 4), 10)
+    if (adjYear !== currentYear) {
+      return notify(`Adjustment date (${adjForm.date}) must be within the active financial year (${currentYear})`)
+    }
+    setAdjConfirmStep(true)
+  }
+
+  const handleConfirmAdjustment = async () => {
+    const amt = Number(adjForm.amount)
+    const signedAmount = adjForm.direction === "trader_owes_more" ? amt : -amt
+    try {
+      if (window.api.insertTraderAdjustment) {
+        await window.api.insertTraderAdjustment({
+          trader_id: Number(selectedTrader),
+          date: adjForm.date,
+          amount: signedAmount,
+          note: adjForm.note.trim()
+        })
+        notify("Adjustment recorded successfully!")
+        setShowAdjustmentModal(false)
+        setAdjConfirmStep(false)
+        refreshLedger(selectedTrader)
+        loadAdjustmentsAndLogs(selectedTrader)
+      }
+    } catch (err) {
+      notify(`Failed to save adjustment: ${err.message}`)
+    }
+  }
+
+  const handleOpenVoidModal = (adj) => {
+    setVoidModalAdj(adj)
+    setVoidReason("")
+  }
+
+  const handleConfirmVoid = async () => {
+    if (!voidReason.trim()) {
+      return notify("A reason is required to void an adjustment")
+    }
+    try {
+      if (window.api.voidTraderAdjustment) {
+        await window.api.voidTraderAdjustment(voidModalAdj.id, voidReason.trim())
+        notify("Adjustment voided successfully!")
+        setVoidModalAdj(null)
+        setVoidReason("")
+        refreshLedger(selectedTrader)
+        loadAdjustmentsAndLogs(selectedTrader)
+      }
+    } catch (err) {
+      notify(`Failed to void adjustment: ${err.message}`)
     }
   }
 
@@ -435,6 +562,22 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
     e.preventDefault()
     if (!traderForm.name.trim()) return
 
+    const isOpeningChanged = editingTraderId &&
+      !traderForm.carried_from_year &&
+      Number(traderForm.opening_balance || 0) !== Number(originalOpeningBalance || 0)
+
+    if (isOpeningChanged) {
+      if (!openingBalanceReason.trim()) {
+        return notify("Reason is required when changing opening balance")
+      }
+      setShowOpeningConfirmModal(true)
+      return
+    }
+
+    await saveTraderData()
+  }
+
+  const saveTraderData = async () => {
     const payload = {
       name: traderForm.name.trim(),
       phone: traderForm.phone,
@@ -448,6 +591,15 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
       if (traderForm.carried_from_year) {
         payload.carried_from_year = traderForm.carried_from_year
       }
+      if (!traderForm.carried_from_year && Number(traderForm.opening_balance || 0) !== Number(originalOpeningBalance || 0)) {
+        if (window.api.updateTraderOpeningBalance) {
+          await window.api.updateTraderOpeningBalance(
+            editingTraderId,
+            Number(traderForm.opening_balance || 0),
+            openingBalanceReason.trim()
+          )
+        }
+      }
       if (window.api.updateTrader) {
         await window.api.updateTrader(editingTraderId, payload)
         notify("Trader profile updated successfully!")
@@ -458,18 +610,27 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
     }
 
     setShowAddTraderModal(false)
+    setShowOpeningConfirmModal(false)
     setEditingTraderId(null)
+    setOpeningBalanceReason("")
     setTraderForm({ name: "", phone: "", address: "", opening_balance: "0", types: [], carried_from_year: null })
     loadData()
+    if (selectedTrader) {
+      refreshLedger(selectedTrader)
+      loadAdjustmentsAndLogs(selectedTrader)
+    }
   }
 
   const handleEditTrader = (trader) => {
     setEditingTraderId(trader.id)
+    const opBal = String(trader.opening_balance ?? "0")
+    setOriginalOpeningBalance(opBal)
+    setOpeningBalanceReason("")
     setTraderForm({
       name: trader.name || "",
       phone: trader.phone || "",
       address: trader.address || "",
-      opening_balance: String(trader.opening_balance || "0"),
+      opening_balance: opBal,
       types: trader.types ? trader.types.split(", ").filter(Boolean) : [],
       carried_from_year: trader.carried_from_year || null
     })
@@ -627,14 +788,19 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
               {!isReadOnly && activeTraderObj && (
                 <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                   <button
+                    onClick={handleOpenAddAdjustment}
+                    style={{ ...btn("#2563eb", "#fff"), flex: 1, fontSize: 12, fontWeight: 600 }}>
+                    ⚖️ Add Adjustment
+                  </button>
+                  <button
                     onClick={() => handleEditTrader(activeTraderObj)}
                     style={{ ...btn("#eef2ff", "#1d4ed8"), flex: 1, fontSize: 12 }}>
-                    ✏️ Edit Trader Details
+                    ✏️ Edit Details
                   </button>
                   <button
                     onClick={() => handleDeleteTrader(activeTraderObj)}
                     style={{ ...btn("#FCEBEB", "#A32D2D"), flex: 1, fontSize: 12 }}>
-                    🗑 Delete Trader
+                    🗑 Delete
                   </button>
                 </div>
               )}
@@ -748,6 +914,118 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
           </div>
         </div>
       </div>
+
+      {/* ADJUSTMENTS & AUDIT HISTORY PANEL */}
+      {selectedTrader && (
+        <div style={card}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <span style={{ fontWeight: 600, fontSize: 14, color: "#1e293b" }}>
+              ⚖️ Adjustments & History — {activeTraderObj?.name}
+            </span>
+            {!isReadOnly && (
+              <button onClick={handleOpenAddAdjustment} style={{ ...btn("#2563eb", "#fff"), fontSize: 12, fontWeight: 600 }}>
+                + Add Adjustment
+              </button>
+            )}
+          </div>
+
+          <div style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+              Adjustments ({traderAdjustments.length})
+            </div>
+            {traderAdjustments.length === 0 ? (
+              <div style={{ fontSize: 12, color: "#94a3b8", fontStyle: "italic", padding: "6px 0" }}>
+                No adjustments recorded for this trader.
+              </div>
+            ) : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr style={{ background: "#f8fafc", borderBottom: "1px solid #e2e8f0" }}>
+                    <th style={{ ...th, fontSize: 12 }}>Date</th>
+                    <th style={{ ...th, fontSize: 12 }}>Adjustment Note</th>
+                    <th style={{ ...th, fontSize: 12, textAlign: "right" }}>Amount</th>
+                    <th style={{ ...th, fontSize: 12, textAlign: "center" }}>Status</th>
+                    {!isReadOnly && <th style={{ ...th, fontSize: 12, textAlign: "center", width: 80 }}>Action</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {traderAdjustments.map(adj => {
+                    const isVoided = Boolean(adj.voided)
+                    const isPositive = adj.amount > 0
+                    return (
+                      <tr key={adj.id} style={{ borderBottom: "1px solid #f1f5f9", background: isVoided ? "#fafafa" : "#fff" }}>
+                        <td style={td}>
+                          {isVoided ? <s style={{ color: "#94a3b8" }}>{fmtDate(adj.date)}</s> : fmtDate(adj.date)}
+                        </td>
+                        <td style={td}>
+                          {isVoided ? (
+                            <div>
+                              <s style={{ color: "#94a3b8" }}>{adj.note}</s>
+                              <div style={{ fontSize: 10, color: "#b91c1c", marginTop: 2, fontStyle: "italic" }}>
+                                Voided: {adj.void_reason} {adj.voided_at ? `(${adj.voided_at.slice(0, 10)})` : ""}
+                              </div>
+                            </div>
+                          ) : (
+                            <span style={{ fontWeight: 500 }}>{adj.note}</span>
+                          )}
+                        </td>
+                        <td style={{ ...td, textAlign: "right", fontWeight: 600 }}>
+                          {isVoided ? (
+                            <s style={{ color: "#94a3b8" }}>{formatINR(adj.amount)}</s>
+                          ) : (
+                            <span style={{ color: isPositive ? "#0F6E56" : "#A32D2D" }}>
+                              {isPositive ? `+${formatINR(adj.amount)}` : formatINR(adj.amount)}
+                            </span>
+                          )}
+                        </td>
+                        <td style={{ ...td, textAlign: "center" }}>
+                          {isVoided ? (
+                            <span style={{ background: "#fee2e2", color: "#b91c1c", padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 600 }}>
+                              Voided
+                            </span>
+                          ) : (
+                            <span style={{ background: "#dcfce7", color: "#15803d", padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 600 }}>
+                              Active
+                            </span>
+                          )}
+                        </td>
+                        {!isReadOnly && (
+                          <td style={{ ...td, textAlign: "center" }}>
+                            {!isVoided && (
+                              <button
+                                onClick={() => handleOpenVoidModal(adj)}
+                                style={{ ...btn("#fee2e2", "#b91c1c"), padding: "2px 8px", fontSize: 10, fontWeight: 600 }}>
+                                Void
+                              </button>
+                            )}
+                          </td>
+                        )}
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {/* Opening Balance Audit Log */}
+          {traderOpeningLogs.length > 0 && (
+            <div style={{ marginTop: 16, paddingTop: 12, borderTop: "1px solid #e2e8f0" }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+                Opening Balance Audit Log ({traderOpeningLogs.length})
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                {traderOpeningLogs.map(log => (
+                  <div key={log.id} style={{ fontSize: 11, padding: "6px 10px", background: "#f8fafc", borderRadius: 6, border: "1px solid #f1f5f9", color: "#475569" }}>
+                    <span style={{ fontWeight: 600, color: "#1e293b" }}>{log.changed_at ? log.changed_at.slice(0, 16) : ""}</span>: Changed from{" "}
+                    <strong>{formatINR(log.old_value)}</strong> to <strong>{formatINR(log.new_value)}</strong> — Reason: <em>{log.reason}</em>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* LOWER PANEL: Consolidated Statement Ledger History */}
       <div style={card}>
@@ -929,13 +1207,30 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
                 </div>
                 <div>
                   <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4 }}>Opening Balance (₹)</label>
-                  <input type="number" value={traderForm.opening_balance} style={inp} onWheel={(e) => e.target.blur()} onChange={e => setTraderForm({ ...traderForm, opening_balance: e.target.value })} />
-                  <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 3 }}>
-                    Positive = trader owes you &nbsp;·&nbsp; Negative (e.g. -5000) = you owe trader
-                  </div>
-                  {Boolean(traderForm.carried_from_year && editingTraderId) && (
-                    <div style={{ fontSize: 10, color: "#0F6E56", marginTop: 3, fontStyle: "italic" }}>
-                      Opening balance carried forward from {traderForm.carried_from_year}
+                  {Boolean(traderForm.carried_from_year && editingTraderId) ? (
+                    <div>
+                      <input type="number" value={traderForm.opening_balance} readOnly
+                        style={{ ...inp, background: "#f1f5f9", color: "#64748b", cursor: "not-allowed" }} />
+                      <div style={{ fontSize: 11, color: "#d97706", marginTop: 4, fontWeight: 500 }}>
+                        Carried forward from {traderForm.carried_from_year}. To correct it, add an adjustment.
+                      </div>
+                    </div>
+                  ) : (
+                    <div>
+                      <input type="number" value={traderForm.opening_balance} style={inp} onWheel={(e) => e.target.blur()}
+                        onChange={e => setTraderForm({ ...traderForm, opening_balance: e.target.value })} />
+                      <div style={{ fontSize: 10, color: "#94a3b8", marginTop: 3 }}>
+                        Positive = trader owes you &nbsp;·&nbsp; Negative (e.g. -5000) = you owe trader
+                      </div>
+                      {editingTraderId && Number(traderForm.opening_balance || 0) !== Number(originalOpeningBalance || 0) && (
+                        <div style={{ marginTop: 8 }}>
+                          <label style={{ fontSize: 11, color: "#b91c1c", fontWeight: 600, display: "block", marginBottom: 2 }}>
+                            Reason for Opening Balance Change *
+                          </label>
+                          <input type="text" placeholder="Explain reason for change..." required value={openingBalanceReason}
+                            onChange={e => setOpeningBalanceReason(e.target.value)} style={inp} />
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -994,6 +1289,154 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
               <button onClick={() => setShowPrintModal(false)} style={btn("#e5e7eb", "#333")}>Cancel</button>
               <button onClick={handlePrint} style={{ ...btn("#1e293b", "#fff"), fontWeight: 600 }}>Print</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Adjustment Modal */}
+      {showAdjustmentModal && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 99999 }}
+          onClick={() => { setShowAdjustmentModal(false); setAdjConfirmStep(false) }}>
+          <div style={{ background: "#fff", borderRadius: 12, padding: 24, width: "100%", maxWidth: "460px", boxShadow: "0 8px 30px rgba(0,0,0,0.2)" }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, fontSize: 16, fontWeight: 700, color: "#1e293b" }}>
+              <span>⚖️ Add Trader Adjustment</span>
+              <button style={{ background: "none", border: "none", fontSize: 22, cursor: "pointer", color: "#888" }}
+                onClick={() => { setShowAdjustmentModal(false); setAdjConfirmStep(false) }}>&times;</button>
+            </div>
+
+            {!adjConfirmStep ? (
+              <form onSubmit={handleReviewAdjustment}>
+                <div style={{ marginBottom: 12 }}>
+                  <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4 }}>Trader</label>
+                  <input type="text" readOnly value={activeTraderObj?.name || ""} style={{ ...inp, background: "#f8fafc", color: "#64748b" }} />
+                </div>
+
+                <div style={{ marginBottom: 12 }}>
+                  <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4 }}>Adjustment Date *</label>
+                  <input type="date" required value={adjForm.date} onChange={e => setAdjForm({ ...adjForm, date: e.target.value })} style={inp} />
+                </div>
+
+                <div style={{ marginBottom: 14 }}>
+                  <label style={{ fontSize: 11, color: "#444", fontWeight: 600, display: "block", marginBottom: 6 }}>Direction of Adjustment *</label>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <label style={{
+                      flex: 1, display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 6, cursor: "pointer",
+                      border: adjForm.direction === "trader_owes_more" ? "2px solid #0F6E56" : "1px solid #e2e8f0",
+                      background: adjForm.direction === "trader_owes_more" ? "#f0fdf4" : "#fff",
+                      fontSize: 12, fontWeight: 600, color: adjForm.direction === "trader_owes_more" ? "#0F6E56" : "#475569"
+                    }}>
+                      <input type="radio" name="adj_direction" value="trader_owes_more" checked={adjForm.direction === "trader_owes_more"}
+                        onChange={() => setAdjForm({ ...adjForm, direction: "trader_owes_more" })} />
+                      Trader owes me more (+)
+                    </label>
+                    <label style={{
+                      flex: 1, display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderRadius: 6, cursor: "pointer",
+                      border: adjForm.direction === "farm_owes_trader" ? "2px solid #A32D2D" : "1px solid #e2e8f0",
+                      background: adjForm.direction === "farm_owes_trader" ? "#fef2f2" : "#fff",
+                      fontSize: 12, fontWeight: 600, color: adjForm.direction === "farm_owes_trader" ? "#A32D2D" : "#475569"
+                    }}>
+                      <input type="radio" name="adj_direction" value="farm_owes_trader" checked={adjForm.direction === "farm_owes_trader"}
+                        onChange={() => setAdjForm({ ...adjForm, direction: "farm_owes_trader" })} />
+                      I owe trader more (-)
+                    </label>
+                  </div>
+                </div>
+
+                <div style={{ marginBottom: 12 }}>
+                  <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4 }}>Amount (₹, positive number) *</label>
+                  <input type="number" min="0.01" step="any" placeholder="e.g. 5000" required value={adjForm.amount}
+                    onWheel={(e) => e.target.blur()} onChange={e => setAdjForm({ ...adjForm, amount: e.target.value })} style={inp} />
+                </div>
+
+                <div style={{ marginBottom: 18 }}>
+                  <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4 }}>Reason / Note *</label>
+                  <input type="text" placeholder="e.g. Dec rate discount correction" required value={adjForm.note}
+                    onChange={e => setAdjForm({ ...adjForm, note: e.target.value })} style={inp} />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" style={btn("#e5e7eb", "#333")} onClick={() => setShowAdjustmentModal(false)}>Cancel</button>
+                  <button type="submit" style={{ ...btn("#2563eb", "#fff"), fontWeight: 600 }}>Review Adjustment →</button>
+                </div>
+              </form>
+            ) : (
+              <div>
+                <div style={{ fontSize: 13, color: "#64748b", marginBottom: 12 }}>
+                  Please review and confirm this adjustment:
+                </div>
+
+                <div style={{ background: "#f8fafc", borderRadius: 8, padding: 12, border: "1px solid #e2e8f0", fontSize: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div><strong>Trader:</strong> {activeTraderObj?.name}</div>
+                  <div><strong>Date:</strong> {fmtDate(adjForm.date)}</div>
+                  <div><strong>Type:</strong> {adjForm.direction === "trader_owes_more" ? "Trader owes me more (+)" : "I owe trader more (-)"}</div>
+                  <div><strong>Adjustment Amount:</strong> {formatINR(adjForm.direction === "trader_owes_more" ? Number(adjForm.amount) : -Number(adjForm.amount))}</div>
+                  <div><strong>Note:</strong> {adjForm.note}</div>
+                </div>
+
+                {(() => {
+                  const delta = adjForm.direction === "trader_owes_more" ? Number(adjForm.amount || 0) : -Number(adjForm.amount || 0)
+                  const nextBalance = netBalance + delta
+                  return (
+                    <div style={{ margin: "16px 0", padding: "12px 14px", background: "#f0fdf4", borderRadius: 8, border: "1px solid #bbf7d0", textAlign: "center", fontSize: 13, fontWeight: 700, color: "#1e293b" }}>
+                      Trader balance will change from <span style={{ color: netBalance >= 0 ? "#0F6E56" : "#A32D2D" }}>{formatINR(netBalance)}</span> to <span style={{ color: nextBalance >= 0 ? "#0F6E56" : "#A32D2D" }}>{formatINR(nextBalance)}</span>
+                    </div>
+                  )
+                })()}
+
+                <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+                  <button type="button" style={btn("#e5e7eb", "#333")} onClick={() => setAdjConfirmStep(false)}>← Back</button>
+                  <button type="button" onClick={handleConfirmAdjustment} style={{ ...btn("#0F6E56", "#fff"), fontWeight: 700 }}>Confirm & Save Adjustment</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Void Adjustment Modal */}
+      {voidModalAdj && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 99999 }}
+          onClick={() => setVoidModalAdj(null)}>
+          <div style={{ background: "#fff", borderRadius: 12, padding: 24, width: "100%", maxWidth: "420px", boxShadow: "0 8px 30px rgba(0,0,0,0.2)" }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 12, color: "#b91c1c" }}>
+              ⚠️ Void Adjustment
+            </div>
+            <div style={{ fontSize: 12, color: "#475569", marginBottom: 12 }}>
+              Are you sure you want to void the adjustment of <strong>{formatINR(voidModalAdj.amount)}</strong> dated <strong>{fmtDate(voidModalAdj.date)}</strong> ({voidModalAdj.note})?
+            </div>
+            <div style={{ marginBottom: 16 }}>
+              <label style={{ fontSize: 11, color: "#666", display: "block", marginBottom: 4 }}>Reason for voiding *</label>
+              <input type="text" placeholder="e.g. Entered in error / duplicate" required value={voidReason} onChange={e => setVoidReason(e.target.value)} style={inp} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button style={btn("#e5e7eb", "#333")} onClick={() => setVoidModalAdj(null)}>Cancel</button>
+              <button style={{ ...btn("#b91c1c", "#fff"), fontWeight: 600 }} onClick={handleConfirmVoid}>Confirm Void</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Opening Balance Confirm Modal */}
+      {showOpeningConfirmModal && (
+        <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.5)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 999999 }}
+          onClick={() => setShowOpeningConfirmModal(false)}>
+          <div style={{ background: "#fff", borderRadius: 12, padding: 24, width: "100%", maxWidth: "420px", boxShadow: "0 8px 30px rgba(0,0,0,0.2)" }}
+            onClick={e => e.stopPropagation()}>
+            <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 12, color: "#1e293b" }}>
+              Confirm Opening Balance Change
+            </div>
+            <div style={{ fontSize: 13, color: "#475569", marginBottom: 12 }}>
+              Opening balance will change from <strong>{formatINR(originalOpeningBalance)}</strong> to <strong>{formatINR(traderForm.opening_balance)}</strong>.
+            </div>
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 16 }}>
+              <strong>Reason:</strong> {openingBalanceReason}
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button style={btn("#e5e7eb", "#333")} onClick={() => setShowOpeningConfirmModal(false)}>Cancel</button>
+              <button style={{ ...btn("#0F6E56", "#fff"), fontWeight: 600 }} onClick={saveTraderData}>Confirm & Save</button>
             </div>
           </div>
         </div>
