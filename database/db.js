@@ -964,6 +964,103 @@ function runYearMigration(fromYear, toYear, options = {}) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TRADER ADJUSTMENTS & OPENING BALANCE AUDIT
+// ─────────────────────────────────────────────────────────────────────────────
+
+function insertTraderAdjustment(data) {
+  if (!data || !data.trader_id) {
+    throw new Error("Trader ID is required.")
+  }
+  if (!data.date) {
+    throw new Error("Adjustment date is required.")
+  }
+  const match = String(data.date).match(/^(\d{4})/)
+  const adjYear = match ? parseInt(match[1], 10) : null
+  if (!adjYear || adjYear !== activeYear) {
+    throw new Error(`Adjustment date (${data.date}) must be within the active financial year (${activeYear}).`)
+  }
+  if (!data.note || typeof data.note !== "string" || !data.note.trim()) {
+    throw new Error("Adjustment note cannot be empty.")
+  }
+  const amount = Number(data.amount)
+  if (isNaN(amount) || amount === 0) {
+    throw new Error("Adjustment amount cannot be zero.")
+  }
+
+  const d = getDb()
+  const info = d.prepare(`
+    INSERT INTO trader_adjustments (date, trader_id, amount, note)
+    VALUES (?, ?, ?, ?)
+  `).run(data.date, Number(data.trader_id), amount, data.note.trim())
+
+  return { id: info.lastInsertRowid, ...data, amount, note: data.note.trim() }
+}
+
+function getTraderAdjustments(traderId) {
+  return getDb().prepare(`
+    SELECT * FROM trader_adjustments
+    WHERE trader_id = ?
+    ORDER BY date DESC, id DESC
+  `).all(traderId)
+}
+
+function voidTraderAdjustment(id, reason) {
+  if (!reason || typeof reason !== "string" || !reason.trim()) {
+    throw new Error("A reason is required to void an adjustment.")
+  }
+  const d = getDb()
+  const adj = d.prepare(`SELECT * FROM trader_adjustments WHERE id = ?`).get(id)
+  if (!adj) {
+    throw new Error(`Adjustment with ID ${id} not found.`)
+  }
+  if (adj.voided) {
+    throw new Error(`Adjustment with ID ${id} is already voided.`)
+  }
+  d.prepare(`
+    UPDATE trader_adjustments
+    SET voided = 1, void_reason = ?, voided_at = datetime('now')
+    WHERE id = ?
+  `).run(reason.trim(), id)
+  return { success: true }
+}
+
+function updateTraderOpeningBalance(traderId, newValue, reason) {
+  const d = getDb()
+  const trader = d.prepare(`SELECT * FROM traders WHERE id = ?`).get(traderId)
+  if (!trader) {
+    throw new Error(`Trader with ID ${traderId} not found.`)
+  }
+  if (trader.carried_from_year !== null && trader.carried_from_year !== undefined) {
+    throw new Error(`Cannot edit opening balance of a trader carried forward from year ${trader.carried_from_year}. To correct it, add an adjustment.`)
+  }
+  if (!reason || typeof reason !== "string" || !reason.trim()) {
+    throw new Error("A reason is required to change opening balance.")
+  }
+  const val = Number(newValue)
+  if (isNaN(val)) {
+    throw new Error("New opening balance must be a valid number.")
+  }
+  const oldVal = Number(trader.opening_balance || 0)
+  const tx = d.transaction(() => {
+    d.prepare(`UPDATE traders SET opening_balance = ? WHERE id = ?`).run(val, traderId)
+    d.prepare(`
+      INSERT INTO trader_opening_log (trader_id, old_value, new_value, reason)
+      VALUES (?, ?, ?, ?)
+    `).run(traderId, oldVal, val, reason.trim())
+  })
+  tx()
+  return { success: true, old_value: oldVal, new_value: val }
+}
+
+function getTraderOpeningLogs(traderId) {
+  return getDb().prepare(`
+    SELECT * FROM trader_opening_log
+    WHERE trader_id = ?
+    ORDER BY changed_at DESC, id DESC
+  `).all(traderId)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EXPORTS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1105,6 +1202,13 @@ module.exports = {
   deleteTrader: (id) => {
     getDb().prepare(`DELETE FROM traders WHERE id=?`).run(id)
   },
+
+  // Trader adjustments & opening balance audit
+  insertTraderAdjustment: (data) => insertTraderAdjustment(data),
+  getTraderAdjustments: (traderId) => getTraderAdjustments(traderId),
+  voidTraderAdjustment: (id, reason) => voidTraderAdjustment(id, reason),
+  updateTraderOpeningBalance: (traderId, newValue, reason) => updateTraderOpeningBalance(traderId, newValue, reason),
+  getTraderOpeningLogs: (traderId) => getTraderOpeningLogs(traderId),
 
   // ───────────────────────────────────────────────
   // FEED ALLOCATIONS

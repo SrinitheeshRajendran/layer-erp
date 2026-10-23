@@ -128,6 +128,21 @@ contextBridge.exposeInMainWorld("api", {
   deleteTrader: (id) =>
     ipcRenderer.invoke("trader:delete", id),
 
+  insertTraderAdjustment: (data) =>
+    ipcRenderer.invoke("traderAdjustment:insert", data),
+
+  getTraderAdjustments: (traderId) =>
+    ipcRenderer.invoke("traderAdjustment:getByTrader", traderId),
+
+  voidTraderAdjustment: (id, reason) =>
+    ipcRenderer.invoke("traderAdjustment:void", id, reason),
+
+  updateTraderOpeningBalance: (traderId, newValue, reason) =>
+    ipcRenderer.invoke("trader:updateOpeningBalance", traderId, newValue, reason),
+
+  getTraderOpeningLogs: (traderId) =>
+    ipcRenderer.invoke("trader:getOpeningLogs", traderId),
+
   insertEggSale: (data) =>
     ipcRenderer.invoke("sale:add", data),
 

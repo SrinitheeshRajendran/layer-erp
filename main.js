@@ -246,6 +246,30 @@ app.whenReady().then(() => {
   )
 
   // =====================================================
+  // TRADER ADJUSTMENTS & OPENING BALANCE AUDIT
+  // =====================================================
+
+  ipcMain.handle("traderAdjustment:insert", (_, data) =>
+    db.insertTraderAdjustment(data)
+  )
+
+  ipcMain.handle("traderAdjustment:getByTrader", (_, traderId) =>
+    db.getTraderAdjustments(traderId)
+  )
+
+  ipcMain.handle("traderAdjustment:void", (_, id, reason) =>
+    db.voidTraderAdjustment(id, reason)
+  )
+
+  ipcMain.handle("trader:updateOpeningBalance", (_, traderId, newValue, reason) =>
+    db.updateTraderOpeningBalance(traderId, newValue, reason)
+  )
+
+  ipcMain.handle("trader:getOpeningLogs", (_, traderId) =>
+    db.getTraderOpeningLogs(traderId)
+  )
+
+  // =====================================================
   // EGG SALES
   // =====================================================
 
