@@ -38,7 +38,7 @@ Your operational objectives:
    - [3.4 Financial Accounting, Trading & Commercial Keywords](#34-financial-accounting-trading--commercial-keywords)
 4. [Complete Detailed Database Schema & Storage Architecture](#4-complete-detailed-database-schema--storage-architecture)
    - [4.1 Database Physical Layout & Yearly Sharding](#41-database-physical-layout--yearly-sharding)
-   - [4.2 Comprehensive Table Schema (All 16 Tables)](#42-comprehensive-table-schema-all-16-tables)
+   - [4.2 Comprehensive Table Schema (All 21 Tables)](#42-comprehensive-table-schema-all-21-tables)
    - [4.3 Indexes & Query Optimization Strategy](#43-indexes--query-optimization-strategy)
    - [4.4 Schema Evolution & Safe Table Rebuilding Migrations](#44-schema-evolution--safe-table-rebuilding-migrations)
 5. [Exhaustive Step-by-Step Data Flows (Every System Operation)](#5-exhaustive-step-by-step-data-flows-every-system-operation)
@@ -633,6 +633,35 @@ CREATE TABLE IF NOT EXISTS batch_closure (
   buyer TEXT,
   notes TEXT
 );
+
+----------------------------------------------------------------
+-- 20. TRADER ADJUSTMENTS: Manual corrections & discounts
+----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trader_adjustments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  date TEXT NOT NULL,
+  trader_id INTEGER NOT NULL,
+  amount REAL NOT NULL,                -- Positive = trader owes farm more; Negative = farm owes trader more
+  note TEXT NOT NULL,                  -- Mandatory business reason
+  created_at TEXT DEFAULT (datetime('now')),
+  voided INTEGER DEFAULT 0,            -- 0 = Active, 1 = Voided (excluded from balances)
+  void_reason TEXT,                    -- Mandatory reason when voided
+  voided_at TEXT,                      -- Timestamp when voided
+  FOREIGN KEY(trader_id) REFERENCES traders(id)
+);
+
+----------------------------------------------------------------
+-- 21. TRADER OPENING LOG: Audit trail for non-migrated opening changes
+----------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS trader_opening_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  trader_id INTEGER NOT NULL,
+  old_value REAL,                      -- Prior opening balance
+  new_value REAL,                      -- New opening balance
+  reason TEXT NOT NULL,                -- Mandatory explanation
+  changed_at TEXT DEFAULT (datetime('now')),
+  FOREIGN KEY(trader_id) REFERENCES traders(id)
+);
 ```
 
 ### 4.3 Indexes & Query Optimization Strategy
@@ -838,12 +867,13 @@ Desktop ERP software cannot mandate manual migrations via command-line tools. Ev
 ### Flow 19: Cross-Batch Trader Ledger Construction & Bill Grouping
 - **Trigger**: User views a trader statement in `Sales.jsx`.
 - **Backend Function**: `db.getCrossBatchTraderLedger(traderId)`.
-- **Data Merging**: Unions 4 streams for that trader across all active and historical batches:
+- **Data Merging**: Unions 5 streams for that trader across all active and historical batches:
   1. `egg_sales`: Credit = amount, Debit = 0.
   2. `feed_allocations`: Debit = $\text{qty\_kg} \times \text{rate\_per\_kg}$, Credit = 0.
   3. `medication_log`: Debit = cost, Credit = 0.
   4. `trader_payments`: If `direction == 'from_trader'` $\rightarrow$ Debit = amount, Credit = 0 ($-\text{payments\_from\_trader}$); else Credit = amount, Debit = 0 ($+\text{payments\_to\_trader}$).
-- **Frontend Consolidation (`groupBillRows`)**: Identifies multi-item entries occurring on the same day for the same batch, sums values, applies line-item tax %, and combines descriptions into a single clean statement line.
+  5. `trader_adjustments`: Non-voided adjustments. If `amount > 0` $\rightarrow$ Credit = amount, Debit = 0 (trader owes farm more); If `amount < 0` $\rightarrow$ Credit = 0, Debit = $|amount|$ (farm owes trader more).
+- **Frontend Consolidation (`groupBillRows`)**: Identifies multi-item entries occurring on the same day for the same batch, sums values, applies line-item tax %, and combines descriptions into a single clean statement line. Adjustments pass through un-grouped.
 
 ### Flow 20: Unified Double-Entry General Account Ledger (10 Streams)
 - **Trigger**: Accountant opens `AccountLedger.jsx`.
@@ -1069,6 +1099,11 @@ Desktop ERP software cannot mandate manual migrations via command-line tools. Ev
 | `trader:getAll` | `ipcMain.handle` | `db.getTraders()` |
 | `trader:update` | `ipcMain.handle` | `db.updateTrader(id, data)` |
 | `trader:delete` | `ipcMain.handle` | `db.deleteTrader(id)` |
+| `trader:insertAdjustment` | `ipcMain.handle` | `db.insertTraderAdjustment(data)` |
+| `trader:getAdjustments` | `ipcMain.handle` | `db.getTraderAdjustments(traderId)` |
+| `trader:voidAdjustment` | `ipcMain.handle` | `db.voidTraderAdjustment(id, reason)` |
+| `trader:updateOpeningBalance` | `ipcMain.handle` | `db.updateTraderOpeningBalance(id, newValue, reason)` |
+| `trader:getOpeningLogs` | `ipcMain.handle` | `db.getTraderOpeningLogs(traderId)` |
 | `sale:add` | `ipcMain.handle` | `db.insertEggSale(data)` |
 | `sale:getAll` | `ipcMain.handle` | `db.getEggSales()` |
 | `sale:getBatch` | `ipcMain.handle` | `db.getEggSalesByBatch(batchId)` |
@@ -1204,9 +1239,19 @@ $$\text{Eggs in Stock (Trays)} = \frac{\text{Total Eggs Produced} - \text{Total 
 
 ### 1. Cross-Batch Trader Ledger Closing Balance Equation
 The net balance owed by or to a trader is dynamically calculated across all transaction streams:
-$$\text{closing} = \text{opening} + \text{egg\_sales} - \text{feed} - \text{medicine(with tax)} + \text{payments\_to\_trader} - \text{payments\_from\_trader}$$
+$$\text{closing} = \text{opening} + \text{egg\_sales} - \text{feed} - \text{medicine(with tax)} + \text{payments\_to\_trader} - \text{payments\_from\_trader} + \text{adjustments}$$
 - **Positive Balance**: Trader owes money to the farm (Asset / Accounts Receivable / Dr).
 - **Negative Balance**: Farm owes money to the trader (Liability / Accounts Payable / Cr).
+- **Adjustments Math**:
+  - Non-voided adjustments are included in `getCrossBatchTraderLedger(traderId)` and `getTraderClosingBalance(...)`.
+  - Positive adjustment (`amount > 0`, "Trader owes me more"): Added to the balance. In ledger: Credit = amount, Debit = 0.
+  - Negative adjustment (`amount < 0`, "I owe trader more"): Subtracted from the balance. In ledger: Credit = 0, Debit = $|amount|$.
+- **Void-Not-Delete Audit Pattern**:
+  - Trader adjustments cannot be deleted. Voiding sets `voided = 1`, `void_reason = <mandatory string>`, and `voided_at = datetime('now')`.
+  - Voided adjustments are immediately excluded from all ledger calculations and closing balance formulas, but remain fully visible in the trader's adjustment history audit card with strikethrough styling and documented reason.
+- **Controlled Opening Balance Editing Rules**:
+  - **Migrated Traders (`carried_from_year IS NOT NULL`)**: Opening balance is strictly read-only in the UI and database (`updateTraderOpeningBalance` throws if attempted). Because the opening balance was calculated directly from the source year's closing balance, any discrepancy must be resolved via an adjustment entry rather than overwriting historical continuity.
+  - **Non-Migrated Traders (`carried_from_year IS NULL`)**: Opening balance can be modified if a data-entry error occurred at initial system setup. A non-empty reason is mandatory. Changes are recorded in `trader_opening_log` (`trader_id`, `old_value`, `new_value`, `reason`, `changed_at`) providing an immutable audit trail.
 
 ### 2. Multi-Year Carried-Forward & Period Opening Balance Formulation
 To reconcile active flock migrations across calendar years without double-counting copied operational rows:
