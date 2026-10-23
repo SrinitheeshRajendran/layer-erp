@@ -902,7 +902,9 @@ function runYearMigration(fromYear, toYear, options = {}) {
       }
 
       // Test failure injection in the middle of Phase A before verification/commit
-      if (options.testInjectPhaseAFail) {
+      if (typeof options.testInjectPhaseAFail === 'function') {
+        options.testInjectPhaseAFail({ toDb, fromDb, traderIdMap, batchIds: verifiedBatchIds })
+      } else if (options.testInjectPhaseAFail) {
         throw new Error('Test injected failure in Phase A transaction')
       }
 
@@ -928,15 +930,14 @@ function runYearMigration(fromYear, toYear, options = {}) {
         }
       }
 
-      // b. For EVERY trader, the carried-over balance (newOpening + copied moving batch effect) equals closing_old within 0.01
+      // b. For EVERY trader, verify the carried-over balance using rows actually copied into toDb
       for (const t of traders) {
         const closingOld = getTraderClosingBalance(fromDb, t.id, t.opening_balance)
         const newTraderId = traderIdMap[t.id]
         const newOpening = toDb.prepare(`SELECT opening_balance FROM traders WHERE id=?`).get(newTraderId)?.opening_balance || 0
-        const copiedEffect = getTraderCopiedEffect(fromDb, t.id, batchIds)
-        const migratedBalance = newOpening + copiedEffect
-        if (Math.abs(migratedBalance - closingOld) > 0.01) {
-          throw new Error(`Pre-commit balance verification failed for trader "${t.name}": old=${closingOld.toFixed(2)}, migrated=${migratedBalance.toFixed(2)}`)
+        const verifiedBalance = newOpening + getTraderCopiedEffect(toDb, newTraderId, batchIds)
+        if (Math.abs(verifiedBalance - closingOld) > 0.01) {
+          throw new Error(`Pre-commit balance verification failed for trader "${t.name}": old=${closingOld.toFixed(2)}, verified=${verifiedBalance.toFixed(2)}`)
         }
       }
     })

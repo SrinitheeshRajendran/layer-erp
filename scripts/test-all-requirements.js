@@ -151,6 +151,106 @@ console.log('\n--- TEST 1.3: existingFlock Count Mismatch Abort ---');
   console.log('✓ existingFlock count mismatch correctly aborted without deleting or skipping silently');
 }
 
+console.log('\n--- TEST 1.4: Pre-Commit Balance Check Catches Corrupted Egg Sale ---');
+{
+  const { tempDir, dbModule } = setupTempEnv('layer-p1-corrupt-egg-');
+  copy2026ToTemp(tempDir);
+
+  const db2026Pre = new Database(path.join(tempDir, 'layererp-2026.db'), { readonly: true });
+  const preFlocks = db2026Pre.prepare(`SELECT COUNT(*) c FROM flocks`).get().c;
+  const preEggSales = db2026Pre.prepare(`SELECT COUNT(*) c FROM egg_sales`).get().c;
+  const preFeed = db2026Pre.prepare(`SELECT COUNT(*) c FROM feed_allocations`).get().c;
+  const preTraders = db2026Pre.prepare(`SELECT COUNT(*) c FROM traders`).get().c;
+  db2026Pre.close();
+
+  let failedCaught = false;
+  let errorMsg = '';
+  try {
+    dbModule.runYearMigration(2026, 2027, {
+      testInjectPhaseAFail: ({ toDb }) => {
+        toDb.prepare(`UPDATE egg_sales SET amount = amount + 500 WHERE id = (SELECT id FROM egg_sales WHERE trader_id IS NOT NULL LIMIT 1)`).run();
+      }
+    });
+  } catch (err) {
+    failedCaught = true;
+    errorMsg = err.message;
+  }
+  dbModule.closeDb();
+
+  assert(failedCaught, 'Expected migration to fail due to corrupted egg_sales amount');
+  assert(errorMsg.includes('Pre-commit balance verification failed for trader'), `Error message must indicate pre-commit balance verification failure. Got: ${errorMsg}`);
+  assert(errorMsg.includes('Migration failed, no data was changed'), `Error message must match required format. Got: ${errorMsg}`);
+  console.log('✓ Pre-commit balance verification correctly caught corrupted egg sale:', errorMsg);
+
+  // Assert old file is untouched
+  const db2026Post = new Database(path.join(tempDir, 'layererp-2026.db'), { readonly: true });
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM flocks`).get().c, preFlocks, '2026 flocks must be unchanged');
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM egg_sales`).get().c, preEggSales, '2026 egg_sales must be unchanged');
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM feed_allocations`).get().c, preFeed, '2026 feed_allocations must be unchanged');
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM traders`).get().c, preTraders, '2026 traders must be unchanged');
+  db2026Post.close();
+  console.log('✓ Source 2026 DB is untouched');
+
+  // Assert new file has no data
+  const db2027Post = new Database(path.join(tempDir, 'layererp-2027.db'), { readonly: true });
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM flocks`).get().c, 0, '2027 flocks must be 0');
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM egg_sales`).get().c, 0, '2027 egg_sales must be 0');
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM feed_allocations`).get().c, 0, '2027 feed_allocations must be 0');
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM traders`).get().c, 0, '2027 traders must be 0');
+  db2027Post.close();
+  console.log('✓ Target 2027 DB has NO data (cleanly rolled back)');
+}
+
+console.log('\n--- TEST 1.5: Pre-Commit Balance Check Catches Wrong Feed Trader ID ---');
+{
+  const { tempDir, dbModule } = setupTempEnv('layer-p1-wrong-trader-');
+  copy2026ToTemp(tempDir);
+
+  const db2026Pre = new Database(path.join(tempDir, 'layererp-2026.db'), { readonly: true });
+  const preFlocks = db2026Pre.prepare(`SELECT COUNT(*) c FROM flocks`).get().c;
+  const preEggSales = db2026Pre.prepare(`SELECT COUNT(*) c FROM egg_sales`).get().c;
+  const preFeed = db2026Pre.prepare(`SELECT COUNT(*) c FROM feed_allocations`).get().c;
+  const preTraders = db2026Pre.prepare(`SELECT COUNT(*) c FROM traders`).get().c;
+  db2026Pre.close();
+
+  let failedCaught = false;
+  let errorMsg = '';
+  try {
+    dbModule.runYearMigration(2026, 2027, {
+      testInjectPhaseAFail: ({ toDb }) => {
+        toDb.prepare(`UPDATE feed_allocations SET trader_id = 999999 WHERE id = (SELECT id FROM feed_allocations WHERE trader_id IS NOT NULL LIMIT 1)`).run();
+      }
+    });
+  } catch (err) {
+    failedCaught = true;
+    errorMsg = err.message;
+  }
+  dbModule.closeDb();
+
+  assert(failedCaught, 'Expected migration to fail due to wrong feed trader_id');
+  assert(errorMsg.includes('Pre-commit balance verification failed for trader'), `Error message must indicate pre-commit balance verification failure. Got: ${errorMsg}`);
+  assert(errorMsg.includes('Migration failed, no data was changed'), `Error message must match required format. Got: ${errorMsg}`);
+  console.log('✓ Pre-commit balance verification correctly caught wrong feed trader ID:', errorMsg);
+
+  // Assert old file is untouched
+  const db2026Post = new Database(path.join(tempDir, 'layererp-2026.db'), { readonly: true });
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM flocks`).get().c, preFlocks, '2026 flocks must be unchanged');
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM egg_sales`).get().c, preEggSales, '2026 egg_sales must be unchanged');
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM feed_allocations`).get().c, preFeed, '2026 feed_allocations must be unchanged');
+  assert.strictEqual(db2026Post.prepare(`SELECT COUNT(*) c FROM traders`).get().c, preTraders, '2026 traders must be unchanged');
+  db2026Post.close();
+  console.log('✓ Source 2026 DB is untouched');
+
+  // Assert new file has no data
+  const db2027Post = new Database(path.join(tempDir, 'layererp-2027.db'), { readonly: true });
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM flocks`).get().c, 0, '2027 flocks must be 0');
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM egg_sales`).get().c, 0, '2027 egg_sales must be 0');
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM feed_allocations`).get().c, 0, '2027 feed_allocations must be 0');
+  assert.strictEqual(db2027Post.prepare(`SELECT COUNT(*) c FROM traders`).get().c, 0, '2027 traders must be 0');
+  db2027Post.close();
+  console.log('✓ Target 2027 DB has NO data (cleanly rolled back)');
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PART 2: OPENING ROW MUST SHOW THE TRUE CARRIED-FORWARD FIGURE
 // ─────────────────────────────────────────────────────────────────────────────

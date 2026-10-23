@@ -1306,6 +1306,10 @@ export default function Sales({ isReadOnly = false, activeYear = null }) {
                 onClick={() => { setShowAdjustmentModal(false); setAdjConfirmStep(false) }}>&times;</button>
             </div>
 
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 14, lineHeight: "1.4" }}>
+              This changes the trader's balance only. It does not change sales or profit reports.
+            </div>
+
             {!adjConfirmStep ? (
               <form onSubmit={handleReviewAdjustment}>
                 <div style={{ marginBottom: 12 }}>
