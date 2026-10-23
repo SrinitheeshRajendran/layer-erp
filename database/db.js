@@ -419,6 +419,33 @@ function initSchema(d) {
       buyer TEXT,
       notes TEXT
     );
+
+    ----------------------------------------------------------------
+    -- TRADER ADJUSTMENTS
+    ----------------------------------------------------------------
+    CREATE TABLE IF NOT EXISTS trader_adjustments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      trader_id INTEGER NOT NULL,
+      amount REAL NOT NULL,
+      note TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now')),
+      voided INTEGER DEFAULT 0,
+      void_reason TEXT,
+      voided_at TEXT
+    );
+
+    ----------------------------------------------------------------
+    -- TRADER OPENING BALANCE AUDIT LOG
+    ----------------------------------------------------------------
+    CREATE TABLE IF NOT EXISTS trader_opening_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      trader_id INTEGER NOT NULL,
+      old_value REAL,
+      new_value REAL,
+      reason TEXT NOT NULL,
+      changed_at TEXT DEFAULT (datetime('now'))
+    );
   `)
 
   // ── Column migrations (safe to run on existing DBs) ──────────
@@ -464,6 +491,8 @@ function initSchema(d) {
     CREATE INDEX IF NOT EXISTS idx_farm_inc_date     ON farm_other_income(date);
     CREATE INDEX IF NOT EXISTS idx_manure_date       ON manure_sales(date);
     CREATE INDEX IF NOT EXISTS idx_egg_prod_batch    ON egg_production(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_trader_adjustments_trader ON trader_adjustments(trader_id);
+    CREATE INDEX IF NOT EXISTS idx_trader_adjustments_date   ON trader_adjustments(date);
   `)
 }
 

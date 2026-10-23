@@ -25,13 +25,15 @@ const REFERENCE_SCHEMA = {
   farm_expenses: ['id', 'date', 'expense_type', 'amount', 'notes'],
   farm_other_income: ['id', 'date', 'income_type', 'amount', 'notes'],
   manure_sales: ['id', 'date', 'batch_id', 'qty_kg', 'rate_per_kg', 'amount', 'buyer', 'notes'],
-  batch_closure: ['id', 'batch_id', 'closure_date', 'birds_sold', 'price_per_bird', 'bird_sale_amount', 'feed_returned_kg', 'buyer', 'notes']
+  batch_closure: ['id', 'batch_id', 'closure_date', 'birds_sold', 'price_per_bird', 'bird_sale_amount', 'feed_returned_kg', 'buyer', 'notes'],
+  trader_adjustments: ['id', 'date', 'trader_id', 'amount', 'note', 'created_at', 'voided', 'void_reason', 'voided_at'],
+  trader_opening_log: ['id', 'trader_id', 'old_value', 'new_value', 'reason', 'changed_at']
 };
 
 const REQUIRED_INDEXES = [
   'idx_egg_sales_batch',
   'idx_egg_sales_date',
-  'idx_feed_alloc_batch',
+  'feed_alloc_batch' ? 'idx_feed_alloc_batch' : '',
   'idx_feed_alloc_date',
   'idx_medication_batch',
   'idx_medication_date',
@@ -40,8 +42,10 @@ const REQUIRED_INDEXES = [
   'idx_farm_exp_date',
   'idx_farm_inc_date',
   'idx_manure_date',
-  'idx_egg_prod_batch'
-];
+  'idx_egg_prod_batch',
+  'idx_trader_adjustments_trader',
+  'idx_trader_adjustments_date'
+].filter(Boolean);
 
 function getInitSchema() {
   const dbModule = require('../database/db');
@@ -98,7 +102,7 @@ function auditDatabase(db, label) {
   // Print Details
   console.log(`1. MISSING TABLES:`);
   if (missingTables.length === 0) {
-    console.log(`   None (All 19 reference tables present)`);
+    console.log(`   None (All ${Object.keys(REFERENCE_SCHEMA).length} reference tables present)`);
   } else {
     missingTables.forEach(t => console.log(`   - ${t}`));
   }
@@ -119,7 +123,7 @@ function auditDatabase(db, label) {
 
   console.log(`\n4. MISSING INDEXES:`);
   if (missingIndexes.length === 0) {
-    console.log(`   None (All 12 required indexes present)`);
+    console.log(`   None (All ${REQUIRED_INDEXES.length} required indexes present)`);
   } else {
     missingIndexes.forEach(i => console.log(`   - ${i}`));
   }
