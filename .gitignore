@@ -29,3 +29,6 @@ packaged_out.log
 # Screenshots
 screenshot*.png
 screen_test.png
+
+# Test output files
+test_*_out.txt
